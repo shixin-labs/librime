@@ -34,20 +34,35 @@ bool UserDbRecoveryTask::Run(Deployer* deployer) {
     return false;
   }
   auto r = As<Recoverable>(db_);
-  if (r && r->Recover()) {
+  if (!r || !r->IsRecoveryNeeded()) {
+    return false;
+  }
+  // A lock acquired by another process after the failed Open must also
+  // prevent repair, rename and recreation. A failed repair alone is not
+  // evidence that it is safe to replace the database.
+  auto recovery_lock = r->AcquireRecoveryLock();
+  if (!recovery_lock) {
+    return false;
+  }
+  if (r->Recover()) {
     return true;
   }
-  // repair didn't work on the damaged db file; remove and recreate it
+  // Repair didn't work; archive the damaged database before recreating it.
   LOG(INFO) << "recreating db file.";
   if (db_->Exists()) {
     std::error_code ec;
     std::filesystem::rename(db_->file_path(),
                             path(db_->file_path()).concat(".old"), ec);
-    if (ec && !db_->Remove()) {
-      LOG(ERROR) << "Error removing db file '" << db_->file_path() << "'.";
+    if (ec) {
+      LOG(ERROR) << "Error archiving db file '" << db_->file_path()
+                 << "': " << ec.message();
       return false;
     }
   }
+  // The damaged directory is now archived. Open acquires the lock on the
+  // replacement itself; keeping the old path registered with LevelDB's Env
+  // would otherwise prevent this process from opening the new database.
+  recovery_lock.reset();
   if (!db_->Open()) {
     LOG(ERROR) << "Error creating db '" << db_->name() << "'.";
     return false;

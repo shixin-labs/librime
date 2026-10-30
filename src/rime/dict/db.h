@@ -87,7 +87,18 @@ class Transactional {
 
 class Recoverable {
  public:
+  class RecoveryLock {
+   public:
+    virtual ~RecoveryLock() = default;
+  };
+
   virtual ~Recoverable() = default;
+  // Only confirmed corruption warrants automatic repair. Lock conflicts,
+  // permission errors and other I/O failures must leave the database alone.
+  virtual bool IsRecoveryNeeded() const = 0;
+  // Keep this guard alive through repair and archiving the damaged database.
+  virtual the<RecoveryLock> AcquireRecoveryLock() = 0;
+  // The caller must hold a RecoveryLock.
   virtual bool Recover() = 0;
 };
 

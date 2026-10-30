@@ -59,6 +59,8 @@ class LevelDb : public Db, public Recoverable, public Transactional {
   bool Erase(const string& key) override;
 
   // Recoverable
+  bool IsRecoveryNeeded() const override;
+  the<RecoveryLock> AcquireRecoveryLock() override;
   bool Recover() override;
 
   // Transactional
@@ -71,6 +73,7 @@ class LevelDb : public Db, public Recoverable, public Transactional {
 
   the<LevelDbWrapper> db_;
   string db_type_;
+  bool recovery_needed_ = false;
 };
 
 }  // namespace rime

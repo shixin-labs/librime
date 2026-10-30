@@ -6,6 +6,7 @@
 //
 
 #include <leveldb/db.h>
+#include <leveldb/env.h>
 #include <leveldb/write_batch.h>
 #include <rime/common.h>
 #include <rime/service.h>
@@ -215,6 +216,39 @@ bool LevelDb::Restore(const path& snapshot_file) {
   return success;
 }
 
+bool LevelDb::IsRecoveryNeeded() const {
+  return !loaded() && recovery_needed_;
+}
+
+namespace {
+
+class LevelDbRecoveryLock : public Recoverable::RecoveryLock {
+ public:
+  explicit LevelDbRecoveryLock(leveldb::FileLock* lock) : lock_(lock) {}
+  ~LevelDbRecoveryLock() override {
+    leveldb::Env::Default()->UnlockFile(lock_);
+  }
+
+ private:
+  leveldb::FileLock* lock_;
+};
+
+}  // namespace
+
+the<Recoverable::RecoveryLock> LevelDb::AcquireRecoveryLock() {
+  if (!IsRecoveryNeeded())
+    return nullptr;
+  leveldb::FileLock* lock = nullptr;
+  auto status = leveldb::Env::Default()->LockFile(
+      (file_path() / "LOCK").string(), &lock);
+  if (!status.ok()) {
+    LOG(WARNING) << "cannot lock db for recovery '" << name()
+                 << "': " << status.ToString();
+    return nullptr;
+  }
+  return make_unique<LevelDbRecoveryLock>(lock);
+}
+
 bool LevelDb::Recover() {
   LOG(INFO) << "trying to recover db '" << name() << "'.";
   auto status = leveldb::RepairDB(file_path().string(), leveldb::Options());
@@ -246,6 +280,7 @@ bool LevelDb::Open() {
   readonly_ = false;
   auto status = db_->Open(file_path(), readonly_);
   loaded_ = status.ok();
+  recovery_needed_ = status.IsCorruption();
 
   if (loaded_) {
     string db_name;
@@ -268,6 +303,7 @@ bool LevelDb::OpenReadOnly() {
   readonly_ = true;
   auto status = db_->Open(file_path(), readonly_);
   loaded_ = status.ok();
+  recovery_needed_ = status.IsCorruption();
 
   if (!loaded_) {
     LOG(ERROR) << "Error opening db '" << name() << "' read-only.";

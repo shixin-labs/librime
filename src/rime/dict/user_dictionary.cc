@@ -172,8 +172,10 @@ bool UserDictionary::Load() {
   if (!db_->loaded() && !db_->Open()) {
     // try to recover managed db in available work thread
     Deployer& deployer(Service::instance().deployer());
+    auto recoverable = As<Recoverable>(db_);
     auto task = DeploymentTask::Require("userdb_recovery_task");
-    if (task && Is<Recoverable>(db_) && !deployer.IsWorking()) {
+    if (task && recoverable && recoverable->IsRecoveryNeeded() &&
+        !deployer.IsWorking()) {
       deployer.ScheduleTask(an<DeploymentTask>(task->Create(db_)));
       deployer.StartWork();
     }
