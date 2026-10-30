@@ -36,7 +36,7 @@ struct Metadata {
   static const int kFormatMaxLength = 32;
   char format[kFormatMaxLength];
   uint32_t dict_file_checksum;
-  uint32_t schema_file_checksum;
+  uint32_t schema_file_checksum;  // Canonical speller checksum; layout unchanged.
   uint32_t num_syllables;
   uint32_t num_spellings;
   uint32_t double_array_size;

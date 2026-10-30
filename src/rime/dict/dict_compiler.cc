@@ -8,8 +8,10 @@
 #include <cfloat>
 #include <cmath>
 #include <fstream>
+#include <iterator>
 #include <rime/algo/algebra.h>
 #include <rime/algo/utilities.h>
+#include <rime/config.h>
 #include <rime/dict/corrector.h>
 #include <rime/dict/dict_compiler.h>
 #include <rime/dict/dict_settings.h>
@@ -77,6 +79,57 @@ static uint32_t compute_dict_file_checksum(uint32_t initial_checksum,
   return cc.Checksum();
 }
 
+static void checksum_size(boost::crc_32_type* crc, uint64_t size) {
+  // Fixed-width, big-endian lengths make the checksum platform-independent.
+  for (int shift = 56; shift >= 0; shift -= 8)
+    crc->process_byte(static_cast<unsigned char>(size >> shift));
+}
+
+static void checksum_string(boost::crc_32_type* crc, const string& value) {
+  checksum_size(crc, value.size());
+  crc->process_bytes(value.data(), value.size());
+}
+
+static void checksum_config_item(boost::crc_32_type* crc,
+                                  an<ConfigItem> item) {
+  crc->process_byte(item ? item->type() : ConfigItem::kNull);
+  if (!item)
+    return;
+  if (auto value = As<ConfigValue>(item)) {
+    checksum_string(crc, value->str());
+  } else if (auto list = As<ConfigList>(item)) {
+    checksum_size(crc, list->size());
+    for (const auto& child : *list)
+      checksum_config_item(crc, child);
+  } else if (auto map = As<ConfigMap>(item)) {
+    checksum_size(crc, std::distance(map->begin(), map->end()));
+    // ConfigMap orders keys; lists retain the spelling rules' order.
+    for (const auto& entry : *map) {
+      checksum_string(crc, entry.first);
+      checksum_config_item(crc, entry.second);
+    }
+  }
+}
+
+static bool compute_speller_checksum(const path& schema_file,
+                                     uint32_t* checksum) {
+  *checksum = 0;
+  if (schema_file.empty())
+    return true;
+  Config schema;
+  if (!schema.LoadFromFile(schema_file)) {
+    LOG(ERROR) << "error loading prism definition from " << schema_file;
+    return false;
+  }
+  // Only spelling rules affect a prism. Hash the parsed subtree, including
+  // node types, lengths and null list entries (which YAML emission omits).
+  // Unrelated settings, timestamps and YAML formatting don't invalidate it.
+  boost::crc_32_type crc;
+  checksum_config_item(&crc, schema.GetItem("speller"));
+  *checksum = crc.checksum();
+  return true;
+}
+
 bool DictCompiler::Compile(const path& schema_file) {
   LOG(INFO) << "compiling dictionary for " << schema_file;
   bool build_table_from_source = true;
@@ -96,8 +149,11 @@ bool DictCompiler::Compile(const path& schema_file) {
   }
   uint32_t dict_file_checksum =
       compute_dict_file_checksum(0, dict_files, settings);
-  uint32_t schema_file_checksum =
-      schema_file.empty() ? 0 : Checksum(schema_file);
+  // Keep the existing on-disk field, now keyed by the speller section.
+  // Prisms with a legacy whole-schema checksum rebuild once on deployment.
+  uint32_t schema_file_checksum;
+  if (!compute_speller_checksum(schema_file, &schema_file_checksum))
+    return false;
   bool rebuild_table = false;
   bool rebuild_prism = false;
   const auto& primary_table = tables_[0];
