@@ -12,6 +12,10 @@
 #include <rime/common.h>
 #include <rime/algo/syllabifier.h>
 #include <rime/dict/table.h>
+#include "subtree_bounds.h"
+#include "subtree_bounds_io.h"
+#include "initial_cache.h"
+#include "mirror_cache.h"
 
 namespace rime {
 
@@ -106,11 +110,11 @@ bool TableQuery::Advance(SyllableId syllable_id,
   if (!Walk(syllable_id)) {
     return false;
   }
+  credibility_[level_] = credibility_sum() + credibility;
+  quality_len_[level_] = quality_len_sum() + quality_len;
+  last_pos_[level_] = last_pos;
   ++level_;
   index_code_.push_back(syllable_id);
-  credibility_.push_back(credibility_sum() + credibility);
-  quality_len_.push_back(quality_len_sum() + quality_len);
-  last_pos_.push_back(last_pos);
   return true;
 }
 
@@ -120,9 +124,6 @@ bool TableQuery::Backdate() {
   --level_;
   if (index_code_.size() > level_) {
     index_code_.pop_back();
-    credibility_.pop_back();
-    quality_len_.pop_back();
-    last_pos_.pop_back();
   }
   return true;
 }
@@ -130,9 +131,6 @@ bool TableQuery::Backdate() {
 void TableQuery::Reset() {
   level_ = 0;
   index_code_.clear();
-  credibility_.clear();
-  quality_len_.clear();
-  last_pos_.clear();
 }
 
 inline static bool node_less(const table::TrunkIndexNode& a,
@@ -262,11 +260,136 @@ bool Table::OnLoad() {
   return true;
 }
 
+struct ShixinTypoInitialCache {
+  shixin_typo::InitialCache cache;
+  std::vector<char> initials;
+  shixin_typo::InitialCacheSearch search;
+  shixin_typo::MirrorCache mirror;
+  bool mirror_required = false;
+  bool mirror_initialized = false;
+  string mirror_path;
+};
+bool Table::PrepareShixinTypoInitialCache(const string& sidecar_path) {
+  if(shixin_typo_initial_cache_) return true;
+  if(!IsOpen() || !index_) return false;
+  auto prepared=std::make_unique<ShixinTypoInitialCache>();
+  path source=sidecar_path.empty()?path(file_path().u8string()+".initial3"):path(sidecar_path);
+  const shixin_typo::BoundIdentity identity{dict_file_checksum(),index_->size,metadata_->num_entries,file_size()};
+  prepared->initials.resize(index_->size);
+  for(size_t a=0;a<index_->size;++a) {
+    auto spelling=GetSyllableById(a);
+    prepared->initials[a]=spelling.empty()?0:spelling[0];
+  }
+  if(!shixin_typo::LoadInitialCache(source,identity,prepared->initials,&prepared->cache)) return false;
+  shixin_typo_initial_cache_=std::move(prepared);return true;
+}
+
+bool Table::PrepareShixinTypoMirrorCache(const string& mirror_path) {
+  if (!shixin_typo_initial_cache_) return false;
+  if (shixin_typo_initial_cache_->mirror_initialized)
+    return shixin_typo_initial_cache_->mirror_path == mirror_path && !shixin_typo_initial_cache_->mirror.native.empty();
+  shixin_typo_initial_cache_->mirror_required = true;
+  shixin_typo_initial_cache_->mirror_initialized = true;
+  shixin_typo_initial_cache_->mirror_path = mirror_path;
+  const shixin_typo::BoundIdentity identity{dict_file_checksum(), index_->size, metadata_->num_entries, file_size()};
+  return shixin_typo::LoadMirror(path(mirror_path), identity,
+      shixin_typo_initial_cache_->cache, &shixin_typo_initial_cache_->mirror);
+}
+
+// Offline experiment: caller supplies a locally built, trusted native Table.
+// This is not a validator for arbitrary untrusted table files.
+bool Table::PrepareShixinTypoCanonicalTable(const string& file) {
+  if (shixin_typo_canonical_initialized_)
+    return file == shixin_typo_canonical_path_ && bool(shixin_typo_canonical_table_);
+  shixin_typo_canonical_initialized_ = true;
+  shixin_typo_canonical_path_ = file;
+  the<Table> prepared(new Table(path(file)));
+  if (!prepared->Load() || !metadata_ ||
+      prepared->metadata()->num_syllables != metadata_->num_syllables)
+    return false;
+  for (size_t i = 0; i < metadata_->num_syllables; ++i)
+    if (prepared->GetSyllableById(i) != GetSyllableById(i))
+      return false;
+  if (!prepared->WarmShixinTypoPages()) return false;
+  shixin_typo_canonical_table_ = std::move(prepared);
+  return true;
+}
+
+// Explicit schema-initialization experiment, never called from Query().
+bool Table::WarmShixinTypoPages() {
+  if (!IsOpen()) return false;
+  volatile unsigned char touched = 0;
+  for (size_t i = 0; i < file_size(); i += 4096)
+    touched ^= static_cast<unsigned char>(address()[i]);
+  (void)touched;
+  return true;
+}
+
+bool Table::WarmShixinTypoStrings() {
+  if (!IsOpen() || !metadata_ || !metadata_->string_table) return false;
+  const char* strings = metadata_->string_table.get();
+  const size_t bytes = metadata_->string_table_size;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(address());
+  const uintptr_t start = reinterpret_cast<uintptr_t>(strings);
+  if (start < base || start - base > file_size() ||
+      bytes > file_size() - (start - base)) return false;
+  volatile unsigned char touched = 0;
+  for (size_t i = 0; i < bytes; i += 4096)
+    touched ^= static_cast<unsigned char>(strings[i]);
+  if (bytes) touched ^= static_cast<unsigned char>(strings[bytes - 1]);
+  (void)touched;
+  return true;
+}
+
+bool Table::WarmShixinTypoIndexes(bool include_short_entries) {
+  if (!IsOpen() || !index_) return false;
+  volatile unsigned char touched = 0;
+  auto touch = [&](const void* pointer, size_t header, size_t count, size_t item) {
+    if (!header && !count) return true;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(address());
+    const uintptr_t start = reinterpret_cast<uintptr_t>(pointer);
+    if (start < base || start - base > file_size()) return false;
+    const size_t available = file_size() - (start - base);
+    if (header > available || count > (available - header) / item) return false;
+    const size_t bytes = header + count * item;
+    const char* data = static_cast<const char*>(pointer);
+    for (size_t i = 0; i < bytes; i += 4096)
+      touched ^= static_cast<unsigned char>(data[i]);
+    if (bytes) touched ^= static_cast<unsigned char>(data[bytes-1]);
+    return true;
+  };
+  if (!touch(index_, offsetof(table::Index, at), index_->size,
+             sizeof(table::HeadIndexNode))) return false;
+  for (const auto& a : *index_) {
+    if (include_short_entries && !touch(a.entries.at.get(), 0, a.entries.size, sizeof(table::Entry))) return false;
+    if (!a.next_level) continue;
+    const auto& two = a.next_level->trunk();
+    if (!touch(&two, offsetof(table::TrunkIndex, at), two.size,
+               sizeof(table::TrunkIndexNode))) return false;
+    for (const auto& b : two) {
+      if (include_short_entries && !touch(b.entries.at.get(), 0, b.entries.size, sizeof(table::Entry))) return false;
+      if (!b.next_level) continue;
+      const auto& three = b.next_level->trunk();
+      if (!touch(&three, offsetof(table::TrunkIndex, at), three.size,
+                 sizeof(table::TrunkIndexNode))) return false;
+      if (include_short_entries)
+        for (const auto& c : three)
+          if (!touch(c.entries.at.get(), 0, c.entries.size, sizeof(table::Entry))) return false;
+    }
+  }
+  (void)touched;
+  return true;
+}
+
 Table::Table(const path& file_path) : MappedFile(file_path) {}
 
 Table::~Table() {}
 
 bool Table::Load() {
+  shixin_typo_canonical_table_.reset();
+  shixin_typo_canonical_path_.clear();
+  shixin_typo_canonical_initialized_ = false;
+  shixin_typo_initial_cache_.reset();
   LOG(INFO) << "loading table file: " << file_path();
 
   if (IsOpen())
@@ -570,17 +693,86 @@ const double kPenaltyForAmbiguousSyllable = -2.995732274;
 
 bool Table::Query(const SyllableGraph& syll_graph,
                   size_t start_pos,
-                  TableQueryResult* result) {
+                  TableQueryResult* result,
+                  bool (*visitor)(void*, size_t, TableAccessor&),
+                  void* visitor_context) {
   if (!result || !index_ || start_pos >= syll_graph.interpreted_length)
     return false;
   result->clear();
-  std::queue<pair<size_t, TableQuery>> q;
+  if(syll_graph.shixin_typo_three_initials) {
+    // Bounds are prepared during schema initialization, never lazily on a key.
+    if(!shixin_typo_initial_cache_ || start_pos!=0 || !syll_graph.shixin_typo_graph_complete) { syll_graph.FailShixinTypo(ShixinTypoStopReason::Other);return false; }
+    const auto found=syll_graph.shixin_typo_initial_exact ? shixin_typo_initial_cache_->search.Exact(
+        std::string_view(syll_graph.shixin_typo_raw_initials.data(),3),
+        shixin_typo_initial_cache_->cache,
+        std::min(syll_graph.shixin_typo_work_left,syll_graph.shixin_typo_probe_cap),syll_graph.shixin_typo_deadline)
+        : shixin_typo_initial_cache_->search.Search(
+        std::string_view(syll_graph.shixin_typo_raw_initials.data(),3),
+        shixin_typo_initial_cache_->cache,
+        std::min(syll_graph.shixin_typo_work_left,syll_graph.shixin_typo_probe_cap),syll_graph.shixin_typo_deadline);
+    syll_graph.shixin_typo_work_left-=std::min(syll_graph.shixin_typo_work_left,found.probes);
+    if(!found.complete) {
+      syll_graph.FailShixinTypo(ShixinTypoStopReason::Other);return false;
+    }
+    for(size_t i=0;i<found.count;++i) {
+      if(!syll_graph.CheckShixinTypoDeadline() || !syll_graph.SpendShixinTypoNode()) { result->clear(); return false; }
+      const auto& candidate=found.entries[i];
+      size_t corrections=0;double credibility=0,quality=0;bool valid=true;
+      for(size_t pos=0;pos<3;++pos) {
+        if(!syll_graph.SpendShixinTypoWork()) { result->clear(); return false; }
+        auto begin=syll_graph.edges.find(pos);
+        if(begin==syll_graph.edges.end()) {valid=false;break;}
+        auto end=begin->second.find(pos+1);
+        if(end==begin->second.end()) {valid=false;break;}
+        auto spelling=end->second.find(candidate.code[pos]);
+        if(spelling==end->second.end()) {valid=false;break;}
+        corrections+=spelling->second.is_correction;
+        credibility+=spelling->second.credibility;
+        quality+=spelling->second.type==kNormalSpelling ? 1 : 0;
+      }
+      if(!valid || corrections!=1) continue;
+      Code code;code.assign(candidate.code.begin(),candidate.code.end());
+      const table::Entry* entry = nullptr;
+      std::string_view cached_text;
+      if (shixin_typo_initial_cache_->mirror_required) {
+        const auto& mirror = shixin_typo_initial_cache_->mirror;
+        const size_t index = mirror.Find(candidate, shixin_typo_initial_cache_->cache,
+                                        shixin_typo_initial_cache_->initials);
+        if (index >= mirror.native.size()) { syll_graph.FailShixinTypo(ShixinTypoStopReason::Other);result->clear();return false; }
+        entry = &mirror.native[index];
+        cached_text = mirror.Text(index);
+      } else {
+        // The offset-only experiment still verifies native membership per query.
+        auto native=QueryPhrases(code);
+        if(!syll_graph.CheckShixinTypoDeadline()) { result->clear(); return false; }
+        entry=Find<table::Entry>(candidate.offset);
+        bool member=false;
+        for(;!native.exhausted();native.Next()) {
+          if(!syll_graph.SpendShixinTypoWork()) { result->clear(); return false; }
+          if(native.entry()==entry) {member=true;break;}
+        }
+        if(!member || entry->weight!=candidate.weight) {syll_graph.FailShixinTypo(ShixinTypoStopReason::Other);result->clear();return false;}
+      }
+      TableAccessor accessor(code,entry,credibility,quality,cached_text);
+      if(visitor) { if(!visitor(visitor_context,3,accessor)) { result->clear(); return false; } }
+      else (*result)[3].push_back(accessor);
+      if(!syll_graph.CheckShixinTypoDeadline()) { result->clear(); return false; }
+    }
+    if(!syll_graph.CheckShixinTypoDeadline()) { result->clear(); return false; }
+    return visitor || !result->empty();
+  }
+  std::deque<std::tuple<size_t, TableQuery, size_t>> q;
   TableQuery initial_state(index_);
-  q.push({start_pos, initial_state});
+  q.push_back({start_pos, initial_state, 0});
   while (!q.empty()) {
-    size_t current_pos = q.front().first;
-    TableQuery query(q.front().second);
-    q.pop();
+    if (!syll_graph.SpendShixinTypoNode()) { result->clear(); return false; }
+    // Corrected lookup completes a phrase branch before expanding every
+    // sibling prefix. Ordinary lookup retains its existing breadth-first order.
+    auto& pending = syll_graph.shixin_typo_bounded ? q.back() : q.front();
+    size_t current_pos = std::get<0>(pending);
+    TableQuery query(std::move(std::get<1>(pending)));
+    size_t corrections = std::get<2>(pending);
+    if (syll_graph.shixin_typo_bounded) q.pop_back(); else q.pop_front();
     auto index = syll_graph.indices.find(current_pos);
     if (index == syll_graph.indices.end()) {
       continue;
@@ -588,13 +780,32 @@ bool Table::Query(const SyllableGraph& syll_graph,
     if (query.level() == Code::kIndexCodeMaxLength) {
       TableAccessor accessor(query.Access(-1));
       if (!accessor.exhausted()) {
-        (*result)[current_pos].push_back(accessor);
+        if (visitor) { if (!visitor(visitor_context,current_pos,accessor)) return false; }
+        else (*result)[current_pos].push_back(accessor);
       }
       continue;
     }
-    for (const auto& spellings : index->second) {
+    // Intersect the smaller native dictionary child set with the graph.
+    // Initial abbreviations can otherwise probe every expanded syllable at
+    // every sparse dictionary node, mostly finding no matching child.
+    auto child_index = syll_graph.shixin_typo_bounded ? query.ShixinTypoChildren() : nullptr;
+    bool sparse = child_index && child_index->size < index->second.size();
+    size_t child = 0;
+    auto spelling_it = index->second.begin();
+    while (sparse ? child < child_index->size : spelling_it != index->second.end()) {
+      auto current = spelling_it;
+      if (sparse) {
+        if (!syll_graph.SpendShixinTypoWork()) { result->clear(); return false; }
+        current = index->second.find(child_index->at[child++].key);
+        if (current == index->second.end()) continue;
+      } else {
+        ++spelling_it;
+      }
+      const auto& spellings = *current;
       SyllableId syll_id = spellings.first;
       for (auto props : spellings.second) {
+        if (!syll_graph.SpendShixinTypoWork()) { result->clear(); return false; }
+        if (syll_graph.shixin_typo_bounded && corrections && props->is_correction) continue;
         size_t end_pos = props->end_pos;
 
         double penalty = 0.0;
@@ -615,18 +826,19 @@ bool Table::Query(const SyllableGraph& syll_graph,
         TableAccessor accessor =
             query.Access(syll_id, next_credibility, delta_quality_len);
         if (!accessor.exhausted()) {
-          (*result)[end_pos].push_back(accessor);
+          if (visitor) { if (!visitor(visitor_context,end_pos,accessor)) return false; }
+          else (*result)[end_pos].push_back(accessor);
         }
         if (end_pos < syll_graph.interpreted_length &&
             query.Advance(syll_id, next_credibility, delta_quality_len,
                           current_pos)) {
-          q.push({end_pos, query});
+          q.push_back({end_pos, query, corrections + props->is_correction});
           query.Backdate();
         }
       }
     }
   }
-  return !result->empty();
+  return visitor || !result->empty();
 }
 
 string Table::GetEntryText(const table::Entry& entry) {

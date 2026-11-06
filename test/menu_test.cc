@@ -77,3 +77,53 @@ TEST(RimeMenuTest, RecipeAlphaBeta) {
   the<Page> no_more_page(menu.CreatePage(5, 1));
   EXPECT_FALSE(bool(no_more_page));
 }
+
+TEST(RimeMenuTest, CorrectionsFollowFirstPageAndKeepNativeIdentity) {
+  Menu menu;
+  menu.AddTranslation(New<TranslationBeta>());
+  auto correction = New<SimpleCandidate>("phrase", 0, 4, "你好", "纠错 → nihao");
+  menu.AddCorrections(New<UniqueTranslation>(correction), 2);
+  the<Page> first(menu.CreatePage(2, 0));
+  ASSERT_TRUE(first);
+  ASSERT_EQ(2, first->candidates.size());
+  EXPECT_EQ("Beta-1", first->candidates[0]->text());
+  EXPECT_EQ("Beta-2", first->candidates[1]->text());
+  EXPECT_FALSE(first->is_last_page);
+  the<Page> second(menu.CreatePage(2, 1));
+  ASSERT_TRUE(second);
+  ASSERT_EQ(2, second->candidates.size());
+  EXPECT_EQ(correction, second->candidates[0]);
+  EXPECT_EQ("Beta-3", second->candidates[1]->text());
+  EXPECT_TRUE(second->is_last_page);
+  EXPECT_EQ(correction, menu.GetCandidateAt(2));
+}
+
+TEST(RimeMenuTest, CorrectionsDeduplicateFirstPageAndPreserveShortMenus) {
+  Menu menu;
+  menu.AddTranslation(New<TranslationBeta>());
+  menu.AddCorrections(New<UniqueTranslation>(
+      New<SimpleCandidate>("phrase", 0, 4, "Beta-2")), 2);
+  EXPECT_EQ(3, menu.Prepare(20));
+  EXPECT_EQ("Beta-3", menu.GetCandidateAt(2)->text());
+  Menu short_menu;
+  short_menu.AddTranslation(New<TranslationAlpha>());
+  short_menu.AddCorrections(New<TranslationBeta>(), 5);
+  the<Page> page(short_menu.CreatePage(5, 0));
+  ASSERT_TRUE(page);
+  EXPECT_EQ(1, page->candidates.size());
+  EXPECT_TRUE(page->is_last_page);
+}
+
+TEST(RimeMenuTest, CorrectionsAfterExactlyFullOrdinaryPage) {
+  Menu menu;
+  menu.AddTranslation(New<TranslationBeta>());
+  menu.AddCorrections(New<TranslationAlpha>(), 3);
+  the<Page> first(menu.CreatePage(3, 0));
+  ASSERT_TRUE(first);
+  EXPECT_FALSE(first->is_last_page);
+  the<Page> second(menu.CreatePage(3, 1));
+  ASSERT_TRUE(second);
+  ASSERT_EQ(1, second->candidates.size());
+  EXPECT_EQ("Alpha", second->candidates[0]->text());
+  EXPECT_TRUE(second->is_last_page);
+}

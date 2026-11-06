@@ -192,6 +192,7 @@ bool Punctuator::AlternatePunct(const string& key,
       return false;
     }
     DLOG(INFO) << "alternating punctuation '" << key << "'.";
+    segment.selected_candidate_override.reset();
     (segment.selected_index += 1) %= segment.menu->candidate_count();
     segment.status = Segment::kGuess;
     return true;
@@ -230,6 +231,7 @@ bool Punctuator::PairPunct(const an<ConfigItem>& definition) {
     }
     DLOG(INFO) << "alternating paired punctuation.";
     auto& oddness(oddness_[definition]);
+    segment.selected_candidate_override.reset();
     (segment.selected_index += oddness) %= 2;
     oddness = 1 - oddness;
     ctx->ConfirmCurrentSelection();

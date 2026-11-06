@@ -28,6 +28,7 @@ struct Chunk {
   size_t matching_code_size = 0;
   double credibility = 0.0;
   double quality_len = 0.0;
+  std::string_view cached_text;
 
   Chunk() = default;
   Chunk(Table* t,
@@ -59,7 +60,8 @@ struct Chunk {
         remaining_code(r),
         matching_code_size(a.index_code().size()),
         credibility(cr),
-        quality_len(q) {}
+        quality_len(q),
+        cached_text(a.cached_text()) {}
 
   bool is_exact_match() const { return matching_code_size == code.size(); }
 
@@ -95,6 +97,7 @@ CodeMatch match_extra_code(const table::Code* extra_code,
                            size_t current_pos,
                            bool predict_word) {
   const CodeMatch kFailed{false, 0, 0};
+  if (!syll_graph.SpendShixinTypoWork()) return kFailed;
   if (!extra_code || depth >= extra_code->size)
     return {true, depth, current_pos};
   if (current_pos >= syll_graph.interpreted_length) {
@@ -155,11 +158,11 @@ an<DictEntry> DictEntryIterator::Peek() {
     // get next entry from current chunk
     const auto& chunk = query_result_->chunks[chunk_index_];
     const auto& e = chunk.entries[chunk.cursor];
-    DLOG(INFO) << "creating temporary dict entry '"
-               << chunk.table->GetEntryText(e) << "'.";
     entry_ = New<DictEntry>();
     entry_->code = chunk.code;
-    entry_->text = chunk.table->GetEntryText(e);
+    entry_->text = chunk.cached_text.empty() ? chunk.table->GetEntryText(e)
+        : string(chunk.cached_text);
+    DLOG(INFO) << "creating temporary dict entry '" << entry_->text << "'.";
     const double kS = 18.420680743952367;  // log(1e8)
     entry_->weight = e.weight - kS + chunk.credibility;
     entry_->quality_len = chunk.quality_len;
@@ -235,6 +238,38 @@ Dictionary::~Dictionary() {
   // should not close shared table and prism objects
 }
 
+struct ShixinTypoLookupContext {
+  Table* table;
+  DictEntryCollector* collector;
+  const SyllableGraph* graph;
+  bool predict_word;
+  double initial_credibility;
+};
+
+static bool collect_table_accessor(void* context, size_t end_pos, TableAccessor& a) {
+  auto& ctx = *static_cast<ShixinTypoLookupContext*>(context);
+  const auto& graph = *ctx.graph;
+  if (!graph.SpendShixinTypoWork()) return false;
+  double cr = ctx.initial_credibility + a.credibility();
+  double q = a.quality_len();
+  if (a.extra_code()) {
+    do {
+      if (!graph.SpendShixinTypoWork()) return false;
+      dictionary::CodeMatch match = dictionary::match_extra_code(
+          a.extra_code(), 0, graph, end_pos, ctx.predict_word);
+      if (!match.success) continue;
+      if (!graph.SpendShixinTypoChunk()) return false;
+      size_t matching_code_size = a.index_code().size() + match.depth;
+      (*ctx.collector)[match.end_pos].AddChunk(
+          {ctx.table, a.code(), a.entry(), matching_code_size, cr, q});
+    } while (a.Next());
+  } else {
+    if (!graph.SpendShixinTypoChunk()) return false;
+    (*ctx.collector)[end_pos].AddChunk({ctx.table, a, cr, q});
+  }
+  return true;
+}
+
 static void lookup_table(Table* table,
                          DictEntryCollector* collector,
                          const SyllableGraph& syllable_graph,
@@ -242,30 +277,22 @@ static void lookup_table(Table* table,
                          bool predict_word,
                          double initial_credibility) {
   TableQueryResult result;
-  if (!table->Query(syllable_graph, start_pos, &result)) {
+  // The existing initial mirror remains its own measured lane. Other bounded
+  // correction graphs use the auxiliary owner, including for string decoding.
+  if (syllable_graph.shixin_typo_bounded && !syllable_graph.shixin_typo_three_initials &&
+      table->ShixinTypoCanonicalTable())
+    table = table->ShixinTypoCanonicalTable();
+  ShixinTypoLookupContext ctx{table, collector, &syllable_graph, predict_word, initial_credibility};
+  if (syllable_graph.shixin_typo_bounded) {
+    // Only completed dictionary chunks are published. The spelling graph was
+    // already completed and validated before dictionary lookup began.
+    table->Query(syllable_graph, start_pos, &result, collect_table_accessor, &ctx);
     return;
   }
-  // copy result
-  for (auto& v : result) {
-    size_t end_pos = v.first;
-    for (TableAccessor& a : v.second) {
-      double cr = initial_credibility + a.credibility();
-      double q = a.quality_len();
-      if (a.extra_code()) {
-        do {
-          dictionary::CodeMatch match = dictionary::match_extra_code(
-              a.extra_code(), 0, syllable_graph, end_pos, predict_word);
-          if (!match.success)
-            continue;
-          size_t matching_code_size = a.index_code().size() + match.depth;
-          (*collector)[match.end_pos].AddChunk(
-              {table, a.code(), a.entry(), matching_code_size, cr, q});
-        } while (a.Next());
-      } else {
-        (*collector)[end_pos].AddChunk({table, a, cr, q});
-      }
-    }
-  }
+  if (!table->Query(syllable_graph, start_pos, &result)) return;
+  for (auto& group : result)
+    for (auto& accessor : group.second)
+      if (!collect_table_accessor(&ctx, group.first, accessor)) return;
 }
 
 an<DictEntryCollector> Dictionary::Lookup(const SyllableGraph& syllable_graph,
@@ -273,26 +300,33 @@ an<DictEntryCollector> Dictionary::Lookup(const SyllableGraph& syllable_graph,
                                           const hash_set<string>* blacklist,
                                           bool predict_word,
                                           double initial_credibility) {
-  if (!loaded())
+  if (!loaded() || (syllable_graph.shixin_typo_bounded && !syllable_graph.shixin_typo_graph_complete))
     return nullptr;
+  if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::Lookup;
   auto collector = New<DictEntryCollector>();
   for (const auto& table : tables_) {
     if (!table->IsOpen())
       continue;
     lookup_table(table.get(), collector.get(), syllable_graph, start_pos,
                  predict_word, initial_credibility);
+    if (syllable_graph.shixin_typo_exhausted) break;
   }
-  if (collector->empty())
+  if (collector->empty() || (syllable_graph.shixin_typo_bounded && syllable_graph.shixin_typo_exhausted))
     return nullptr;
   // for each group of equal code length, sort it and filter words
   for (auto& v : *collector) {
+    if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::BeforeSort;
+    if (syllable_graph.shixin_typo_bounded && !syllable_graph.CheckShixinTypoDeadline()) return nullptr;
+    if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::Sort;
     v.second.Sort();
+    if (syllable_graph.shixin_typo_bounded && !syllable_graph.CheckShixinTypoDeadline()) return nullptr;
     if (blacklist && !blacklist->empty()) {
       v.second.AddFilter([blacklist](an<DictEntry> entry) {
         return entry && !blacklist->count(entry->text);
       });
     }
   }
+  if (syllable_graph.shixin_typo_bounded && !syllable_graph.CheckShixinTypoDeadline()) return nullptr;
   return collector;
 }
 

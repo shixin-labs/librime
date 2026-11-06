@@ -12,6 +12,7 @@ endif(BUILD_SHARED_LIBS)
 
 file(GLOB test_data_files ${PROJECT_SOURCE_DIR}/data/test/*.yaml)
 file(COPY ${test_data_files} DESTINATION ${EXECUTABLE_OUTPUT_PATH})
+file(COPY fixtures/typo.forms.tsv DESTINATION ${EXECUTABLE_OUTPUT_PATH})
 
 add_test(NAME rime_test
   COMMAND rime_test

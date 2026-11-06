@@ -25,6 +25,9 @@ class RIME_DLL Translation {
 
   virtual an<Candidate> Peek() = 0;
 
+  // Scratch-only detached recovery channel, never part of ordinary enumeration.
+  virtual an<Translation> TakeShixinTypoCorrections() { return nullptr; }
+
   // should it provide the next candidate (negative value, zero) or
   // should it give up the chance for other translations (positive)?
   virtual int Compare(an<Translation> other, const CandidateList& candidates);

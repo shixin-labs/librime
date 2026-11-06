@@ -35,6 +35,11 @@ static CandidateList::iterator find_text_match(const an<Candidate>& target,
                                                CandidateList::iterator end) {
   for (auto iter = begin; iter != end; ++iter) {
     if ((*iter)->text() == target->text()) {
+      // Scratch prototype: a correction consuming a different raw span must
+      // remain selectable beside the ordinary partial candidate.
+      if (((*iter)->is_shixin_typo_correction() || target->is_shixin_typo_correction()) &&
+          ((*iter)->start() != target->start() || (*iter)->end() != target->end()))
+        continue;
       return iter;
     }
   }

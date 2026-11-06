@@ -12,6 +12,74 @@
 
 namespace rime {
 
+namespace {
+// The ordinary filter history is populated by Menu::Prepare as usual. Never
+// prefetch its first page into a private buffer: uniquifier depends on history.
+class CorrectionsAfterPage : public Translation {
+ public:
+  CorrectionsAfterPage(an<Translation> ordinary, an<Translation> corrections,
+                       CandidateList* history, size_t page_size)
+      : ordinary_(std::move(ordinary)), corrections_(std::move(corrections)),
+        history_(history), head_left_(page_size) { Refresh(); }
+  an<Candidate> Peek() override {
+    return exhausted() ? nullptr : (in_corrections_ ? corrections_ : ordinary_)->Peek();
+  }
+  bool Next() override {
+    if (exhausted()) return false;
+    if (in_corrections_) {
+      corrections_->Next();
+      ++correction_count_;
+    } else {
+      ordinary_->Next();
+      if (head_left_) --head_left_;
+    }
+    Refresh();
+    return !exhausted();
+  }
+ private:
+  void Refresh() {
+    in_corrections_ = false;
+    // Short ordinary menus stay unchanged, including their last-page status.
+    if (head_left_) {
+      set_exhausted(ordinary_->exhausted());
+      return;
+    }
+    while (corrections_ && !corrections_->exhausted() && correction_count_ < 8) {
+      auto candidate = corrections_->Peek();
+      bool duplicate = !candidate;
+      if (candidate) {
+        for (const auto& previous : *history_) {
+          if (previous->text() == candidate->text() &&
+              previous->start() == candidate->start() && previous->end() == candidate->end()) {
+            duplicate = true;
+            break;
+          }
+        }
+      }
+      if (!duplicate) {
+        in_corrections_ = true;
+        set_exhausted(false);
+        return;
+      }
+      corrections_->Next();
+      ++correction_count_;
+    }
+    corrections_.reset();
+    set_exhausted(ordinary_->exhausted());
+  }
+  an<Translation> ordinary_, corrections_;
+  CandidateList* history_;
+  size_t head_left_, correction_count_ = 0;
+  bool in_corrections_ = false;
+};
+}  // namespace
+
+void Menu::AddCorrections(an<Translation> corrections, size_t page_size) {
+  if (!corrections || corrections->exhausted() || !candidates_.empty() ||
+      page_size == 0 || page_size > 10) return;
+  result_ = New<CorrectionsAfterPage>(result_, std::move(corrections), &candidates_, page_size);
+}
+
 Menu::Menu() : merged_(new MergedTranslation(candidates_)), result_(merged_) {}
 
 void Menu::AddTranslation(an<Translation> translation) {

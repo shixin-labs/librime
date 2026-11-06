@@ -11,6 +11,12 @@
 #include <rime/commit_history.h>
 #include <rime/composition.h>
 
+namespace shixin_typo {
+class CorrectionRegistry;
+struct CorrectionView;
+struct CorrectionToken;
+}
+
 namespace rime {
 
 class Candidate;
@@ -25,8 +31,17 @@ class RIME_DLL Context {
   using KeyEventNotifier =
       signal<void(Context* ctx, const KeyEvent& key_event)>;
 
-  Context() = default;
-  ~Context() = default;
+  Context();
+  ~Context();
+
+  // Scratch native API. Configure off the key path with an engine-owned,
+  // non-reused generation identity before accepting correction requests.
+  bool ConfigureShixinTypoCorrections(uint64_t generation);
+  void InvalidateShixinTypoCorrections();
+  bool PublishShixinTypoCorrections();
+  size_t ShixinTypoCorrectionSize() const;
+  bool ReadShixinTypoCorrection(size_t index, shixin_typo::CorrectionView* view) const;
+  bool SelectShixinTypoCorrection(const shixin_typo::CorrectionToken& token);
 
   bool Commit();
   string GetCommitText() const;
@@ -46,6 +61,8 @@ class RIME_DLL Context {
 
   // return false if there is no candidate at index
   bool Select(size_t index);
+  // Internal native hook. Caller must validate its composition/revision token.
+  bool SelectExplicitCandidate(an<Candidate> candidate);
   // return false if the selected index has not changed
   bool Highlight(size_t index);
   bool DeleteCandidate(size_t index);
@@ -97,6 +114,9 @@ class RIME_DLL Context {
 
  private:
   string GetSoftCursor() const;
+
+  the<shixin_typo::CorrectionRegistry> shixin_typo_registry_;
+  uint64_t shixin_typo_generation_ = 0, shixin_typo_incarnation_ = 0, shixin_typo_revision_ = 0;
 
   string input_;
   size_t caret_pos_ = 0;

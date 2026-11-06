@@ -7,6 +7,7 @@
 // 2011-07-10 GONG Chen <chen.sst@gmail.com>
 //
 #include <algorithm>
+#include <array>
 #include <stack>
 #include <cmath>
 #include <boost/algorithm/string/join.hpp>
@@ -19,6 +20,8 @@
 #include <rime/engine.h>
 #include <rime/language.h>
 #include <rime/schema.h>
+#include <rime/service.h>
+#include <rime/deployer.h>
 #include <rime/translation.h>
 #include <rime/algo/syllabifier.h>
 #include <rime/dict/corrector.h>
@@ -26,12 +29,22 @@
 #include <rime/dict/user_dictionary.h>
 #include <rime/gear/poet.h>
 #include <rime/gear/script_translator.h>
+#include "search_diagnostics.h"
 #include <rime/gear/translator_commons.h>
 
 // static const char* quote_left = "\xef\xbc\x88";
 // static const char* quote_right = "\xef\xbc\x89";
 
 namespace rime {
+namespace {
+thread_local bool shixin_typo_diagnostics_enabled = false;
+thread_local ShixinTypoSearchDiagnostics shixin_typo_diagnostics;
+}
+void EnableShixinTypoSearchDiagnostics(bool enabled) {
+  shixin_typo_diagnostics_enabled = enabled;
+  shixin_typo_diagnostics = {};
+}
+ShixinTypoSearchDiagnostics ReadShixinTypoSearchDiagnostics() { return shixin_typo_diagnostics; }
 
 namespace {
 
@@ -49,7 +62,8 @@ struct SyllabifyTask {
 
 static bool syllabify_dfs(SyllabifyTask* task,
                           size_t depth,
-                          size_t current_pos) {
+                          size_t current_pos, size_t* budget = nullptr) {
+  if (budget) { if (!*budget) return false; --*budget; }
   if (depth == task->code.size()) {
     return current_pos == task->target_pos;
   }
@@ -65,7 +79,7 @@ static bool syllabify_dfs(SyllabifyTask* task,
     auto x = y.second.find(syllable_id);
     if (x != y.second.end()) {
       task->push(task, depth, current_pos, end_vertex_pos);
-      if (syllabify_dfs(task, depth + 1, end_vertex_pos))
+      if (syllabify_dfs(task, depth + 1, end_vertex_pos, budget))
         return true;
       task->pop(task, depth);
     }
@@ -96,9 +110,13 @@ class ScriptSyllabifier : public PhraseSyllabifier {
   size_t BuildSyllableGraph(Prism& prism);
   string GetPreeditString(const Phrase& cand) const;
   string GetOriginalSpelling(const Phrase& cand) const;
+  int ShixinTypoCorrectionCount(const Code& code, size_t code_length, shixin_typo::EditTrace* trace = nullptr) const;
   bool IsCorrection(const Code& code, size_t code_length) const;
 
   const SyllableGraph& syllable_graph() const { return syllable_graph_; }
+  void ShixinTypoCarryBudget(const SyllableGraph& source) {
+    syllable_graph_.CarryShixinTypoBudgetFrom(source);
+  }
 
  protected:
   ScriptTranslator* translator_;
@@ -133,6 +151,77 @@ class ScriptTranslation : public Translation {
   virtual bool Next();
   virtual an<Candidate> Peek();
 
+ public:
+  void ShixinTypoCarryBudget(const ScriptTranslation& source) {
+    syllabifier_->ShixinTypoCarryBudget(source.syllabifier_->syllable_graph());
+  }
+  void ShixinTypoCarryBudget(const SyllableGraph& budget) { syllabifier_->ShixinTypoCarryBudget(budget); }
+  void ShixinTypoCopyBudgetTo(SyllableGraph& budget) const { budget.CarryShixinTypoBudgetFrom(syllabifier_->syllable_graph()); }
+  bool ShixinTypoBudgetAvailable() const {
+    const auto& graph = syllabifier_->syllable_graph();
+    return !graph.shixin_typo_exhausted && graph.shixin_typo_work_left &&
+        graph.shixin_typo_nodes_left && graph.shixin_typo_chunks_left &&
+        std::chrono::steady_clock::now() < graph.shixin_typo_deadline;
+  }
+  void ShixinTypoRecordStage(size_t index, bool found, bool available) const {
+    if (!shixin_typo_diagnostics_enabled || index >= 2) return;
+    const auto& graph = syllabifier_->syllable_graph();
+    auto& stage = shixin_typo_diagnostics.stages[index];
+    stage = {true, found, available, graph.shixin_typo_graph_complete,
+             graph.shixin_typo_stop_reason, graph.shixin_typo_phase, graph.shixin_typo_work_left,
+             graph.shixin_typo_nodes_left, graph.shixin_typo_chunks_left};
+    // The final availability check can observe expiry without mutating graph.
+    if (!available && stage.stop == ShixinTypoStopReason::None) {
+      stage.stop = !stage.work_left ? ShixinTypoStopReason::Work
+                 : !stage.nodes_left ? ShixinTypoStopReason::Nodes
+                 : !stage.chunks_left ? ShixinTypoStopReason::Chunks
+                 : std::chrono::steady_clock::now() >= graph.shixin_typo_deadline
+                     ? ShixinTypoStopReason::Deadline : ShixinTypoStopReason::Other;
+    }
+  }
+  size_t ShixinTypoPreferredAnchor(const string& raw, Table* table) const {
+    const auto& graph = syllabifier_->syllable_graph();
+    const size_t end = graph.input_length;
+    if (end > 32) return 0;
+    std::array<int,33> cost, anchor;
+    cost.fill(100000); anchor.fill(-1); cost[end]=0;
+    for (size_t p=end; p-->0;) {
+      auto it=graph.edges.find(p);
+      if (it==graph.edges.end()) continue;
+      for (const auto& edge:it->second) {
+        size_t next=edge.first;
+        if (next>end || next<=p || cost[next]==100000) continue;
+        // Graph edges consume delimiters, but those bytes are not part of a
+        // canonical syllable and must not make an exact prefix look mistyped.
+        size_t spelling_begin = p, spelling_end = next;
+        const auto& delimiters = translator_->delimiters();
+        while (spelling_begin < spelling_end && delimiters.find(raw[spelling_begin]) != string::npos) ++spelling_begin;
+        while (spelling_end > spelling_begin && delimiters.find(raw[spelling_end-1]) != string::npos) --spelling_end;
+        bool normal=false;
+        for (const auto& spelling:edge.second)
+          if (spelling.second.type==kNormalSpelling && !spelling.second.is_correction &&
+              table->GetSyllableById(spelling.first)==raw.substr(spelling_begin,spelling_end-spelling_begin)) normal=true;
+        int candidate=cost[next]+(normal?0:int(spelling_end-spelling_begin));
+        if (candidate<cost[p]) {
+          cost[p]=candidate;
+          anchor[p]=normal?anchor[next]:int(spelling_begin);
+        }
+      }
+    }
+    return anchor[0]>=0?size_t(anchor[0]):0;
+  }
+  bool ShixinTypoCorrectionTrace(const Phrase& phrase, shixin_typo::EditTrace* trace) const {
+    if (!trace || phrase.end() < start_ || phrase.end() > 32) return false;
+    *trace = {};
+    if (syllabifier_->ShixinTypoCorrectionCount(phrase.code(), phrase.end()-start_, trace) != 1 ||
+        trace->kind == shixin_typo::EditTrace::Kind::None) return false;
+    trace->begin += start_;
+    trace->end += start_;
+    return true;
+  }
+  int ShixinTypoCorrectionCount(const Phrase& phrase) const {
+    return syllabifier_->ShixinTypoCorrectionCount(phrase.code(), phrase.end()-start_);
+  }
  protected:
   bool CheckEmpty();
   bool IsNormalSpelling() const;
@@ -177,12 +266,22 @@ class ScriptTranslation : public Translation {
   bool enable_correction_;
 };
 
+#include "protected_translation.inc"
+#include "hypothesis_translation.inc"
+
 // ScriptTranslator implementation
 
 ScriptTranslator::ScriptTranslator(const Ticket& ticket)
     : Translator(ticket), Memory(ticket), TranslatorOptions(ticket) {
   if (!engine_)
     return;
+  string shixin_typo_initial_cache_path, shixin_typo_mirror_cache_path, shixin_typo_canonical_path;
+  auto resource_path=[](const string& name) {
+    if(name.empty()) return name;
+    path p(name);
+    return (p.is_absolute()?p:Service::instance().deployer().staging_dir/p).u8string();
+  };
+  bool shixin_typo_warm_original = false, shixin_typo_warm_strings = false, shixin_typo_warm_indexes = false, shixin_typo_warm_entries = false;
   if (Config* config = engine_->schema()->config()) {
     config->GetInt(name_space_ + "/spelling_hints", &spelling_hints_);
     config->GetInt(name_space_ + "/max_word_length", &max_word_length_);
@@ -190,6 +289,31 @@ ScriptTranslator::ScriptTranslator(const Ticket& ticket)
     config->GetBool(name_space_ + "/always_show_comments",
                     &always_show_comments_);
     config->GetBool(name_space_ + "/enable_correction", &enable_correction_);
+    config->GetBool(name_space_ + "/shixin_typo_protected", &shixin_typo_protect_);
+    config->GetBool(name_space_ + "/shixin_typo_separate", &shixin_typo_separate_);
+    string hypothesis_model;
+    if (config->GetString(name_space_ + "/shixin_typo_hypothesis_model", &hypothesis_model)) {
+      shixin_typo_hypotheses_.reset(new shixin_typo::HypothesisPolicy);
+      if (!shixin_typo_hypotheses_->Load(resource_path(hypothesis_model))) {
+        shixin_typo_hypotheses_.reset(); shixin_typo_mirror_unavailable_ = true;
+      }
+    }
+    if (shixin_typo_protect_) {
+      config->GetString(name_space_ + "/shixin_typo_initial_cache_file", &shixin_typo_initial_cache_path);
+config->GetString(name_space_ + "/shixin_typo_mirror_cache_file", &shixin_typo_mirror_cache_path);
+      config->GetString(name_space_ + "/shixin_typo_canonical_table_file", &shixin_typo_canonical_path);
+      config->GetBool(name_space_ + "/shixin_typo_warm_original", &shixin_typo_warm_original);
+      config->GetBool(name_space_ + "/shixin_typo_warm_strings", &shixin_typo_warm_strings);
+      config->GetBool(name_space_ + "/shixin_typo_warm_indexes", &shixin_typo_warm_indexes);
+      config->GetBool(name_space_ + "/shixin_typo_warm_short_entries", &shixin_typo_warm_entries);
+      config->GetInt(name_space_ + "/shixin_typo_bound_probe_cap", &shixin_typo_probe_cap_);
+      shixin_typo_probe_cap_=std::max(0,std::min(32768,shixin_typo_probe_cap_));
+      config->GetInt(name_space_ + "/shixin_typo_work_cap", &shixin_typo_work_cap_);
+      shixin_typo_work_cap_=std::max(0,std::min(32768,shixin_typo_work_cap_));
+      constexpr const char* keys[] = {"date","time","week","datetime","timestamp","datezh","dateen"};
+      for (size_t i=0;i<shixin_typo_reserved_codes_.size();i++)
+        config->GetString(string("date_translator/")+keys[i],&shixin_typo_reserved_codes_[i]);
+    }
     if (!config->GetBool(name_space_ + "/enable_word_completion",
                          &enable_word_completion_)) {
       enable_word_completion_ = enable_completion_;
@@ -197,6 +321,21 @@ ScriptTranslator::ScriptTranslator(const Ticket& ticket)
     config->GetInt(name_space_ + "/max_homophones", &max_homophones_);
     poet_.reset(new Poet(language(), config));
   }
+  if (shixin_typo_protect_ && dict_ && dict_->loaded())
+    for (const auto& table : dict_->tables()) {
+  if (shixin_typo_warm_original && !table->WarmShixinTypoPages())
+    shixin_typo_mirror_unavailable_ = true;
+  if (shixin_typo_warm_strings && !table->WarmShixinTypoStrings())
+    shixin_typo_mirror_unavailable_ = true;
+  if ((shixin_typo_warm_indexes || shixin_typo_warm_entries) && !table->WarmShixinTypoIndexes(shixin_typo_warm_entries))
+    shixin_typo_mirror_unavailable_ = true;
+  if (!table->PrepareShixinTypoInitialCache(resource_path(shixin_typo_initial_cache_path)))
+    shixin_typo_mirror_unavailable_ = true;
+  if (!shixin_typo_canonical_path.empty() && !table->PrepareShixinTypoCanonicalTable(shixin_typo_canonical_path))
+    shixin_typo_mirror_unavailable_ = true;
+  if (!shixin_typo_mirror_cache_path.empty() && !table->PrepareShixinTypoMirrorCache(resource_path(shixin_typo_mirror_cache_path)))
+    shixin_typo_mirror_unavailable_ = true;
+}
   if (enable_correction_) {
     if (auto* corrector = Corrector::Require("corrector")) {
       corrector_.reset(corrector->Create(ticket));
@@ -219,6 +358,108 @@ an<Translation> ScriptTranslator::Query(const string& input,
       user_dict_ && user_dict_->loaded() && !IsUserDictDisabledFor(input);
 
   size_t end_of_input = engine_->context()->input().length();
+  if (shixin_typo_protect_) {
+    if (shixin_typo_diagnostics_enabled) { shixin_typo_diagnostics = {}; shixin_typo_diagnostics.input_bytes = input.size(); }
+    auto ordinary = New<ScriptTranslation>(this, nullptr, poet_.get(), input,
+        segment.start, end_of_input, max_sentences_, sentence_cutoff_threshold_);
+    bool has_ordinary = ordinary->Evaluate(dict_.get(), enable_user_dict ? user_dict_.get() : nullptr);
+    an<ScriptTranslation> recovery, broad;
+    bool reserved = false;
+    for (const auto& tag : segment.tags)
+      if (tag == "punct" || tag == "number" || tag == "unicode" ||
+          tag == "calculator" || tag == "radical_lookup" || tag == "email" ||
+          tag == "url" || tag == "underscore" || tag == "gregorian_to_lunar")
+        reserved = true;
+    for (const auto& code : shixin_typo_reserved_codes_)
+      if (!code.empty() && input == code) reserved = true;
+    if (shixin_typo_hypotheses_ && shixin_typo_separate_) {
+      auto pool=New<ShixinTypoHypothesisTranslation>();
+      SyllableGraph budget;
+      budget.shixin_typo_bounded=true;
+      budget.shixin_typo_work_left=shixin_typo_work_cap_;
+#ifdef SHIXIN_TYPO_SANITIZER_TEST
+      budget.shixin_typo_deadline=std::chrono::steady_clock::now()+std::chrono::minutes(1);
+#else
+      budget.shixin_typo_deadline=std::chrono::steady_clock::now()+std::chrono::microseconds(900);
+#endif
+      if (!reserved && !shixin_typo_mirror_unavailable_ && corrector_ && corrector_->ShixinTypoBounded()) {
+        auto plan=shixin_typo_hypotheses_->Plan(input,budget);
+        corrector_->ShixinTypoSpecific(false);
+        corrector_->ShixinTypoAbbreviated(false);
+        if (plan.complete) for(size_t h=0;h<plan.count && budget.CheckShixinTypoDeadline();++h) {
+          corrector_->ShixinTypoTarget(&plan.hypotheses[h].edit);
+          corrector_->ShixinTypoAbbreviated(shixin_typo::HypothesisPolicy::ThreeInitials(input) &&
+              shixin_typo::HypothesisPolicy::ThreeInitials(plan.hypotheses[h].spelling()));
+          auto lookup=New<ScriptTranslation>(this,corrector_.get(),poet_.get(),input,
+              segment.start,end_of_input,max_sentences_,sentence_cutoff_threshold_);
+          lookup->ShixinTypoCarryBudget(budget);
+          bool found=lookup->Evaluate(dict_.get(),enable_user_dict?user_dict_.get():nullptr);
+          for(size_t i=0;found && i<10 && !lookup->exhausted() && lookup->ShixinTypoBudgetAvailable();++i) {
+            auto c=lookup->Peek();
+            auto phrase=As<Phrase>(c);
+            shixin_typo::EditTrace trace;
+            if (phrase && lookup->ShixinTypoCorrectionTrace(*phrase,&trace))
+              pool->Add(h,New<ShixinTypoCorrectionCandidate>(c,trace));
+            // Never advance into an eleventh native entry.
+            if(i+1<10) lookup->Next();
+          }
+          lookup->ShixinTypoRecordStage(std::min(h,size_t(1)),found,lookup->ShixinTypoBudgetAvailable());
+          lookup->ShixinTypoCopyBudgetTo(budget);
+          if(!budget.CheckShixinTypoDeadline()) { pool->Discard(h); break; }
+        }
+        corrector_->ShixinTypoTarget(nullptr);
+        corrector_->ShixinTypoSpecific(false);
+        corrector_->ShixinTypoAbbreviated(false);
+      }
+      pool->Finish();
+      return New<ShixinTypoSeparateTranslation>(has_ordinary?New<DistinctTranslation>(ordinary):nullptr,pool);
+    }
+    if (!reserved && !shixin_typo_mirror_unavailable_ && input.size() >= 3 && input.size() <= 32 && corrector_ && corrector_->ShixinTypoBounded()) {
+      const auto preferred_anchor=ordinary->ShixinTypoPreferredAnchor(input,dict_->primary_table().get());
+      if (shixin_typo_diagnostics_enabled) shixin_typo_diagnostics.preferred_anchor = preferred_anchor;
+      const bool cache_first=input.size()==3;
+      corrector_->ShixinTypoAnchor(cache_first?size_t(-1):preferred_anchor);
+      corrector_->ShixinTypoSpecific(!cache_first);
+      corrector_->ShixinTypoAbbreviated(cache_first);
+      recovery = New<ScriptTranslation>(this, corrector_.get(), poet_.get(), input,
+          segment.start, end_of_input, max_sentences_, sentence_cutoff_threshold_);
+      bool has_recovery = recovery->Evaluate(dict_.get(), enable_user_dict ? user_dict_.get() : nullptr);
+      const bool recovery_available = recovery->ShixinTypoBudgetAvailable();
+      recovery->ShixinTypoRecordStage(0, has_recovery, recovery_available);
+      if (recovery_available) {
+        corrector_->ShixinTypoSpecific(cache_first);
+        corrector_->ShixinTypoAbbreviated(false);
+        // A fully valid alternate segmentation can hide the typo position.
+        // The second stage explores other exact-prefix boundaries under the
+        // same carried composition budget, rather than repeating one anchor.
+        corrector_->ShixinTypoAnchor(size_t(-1));
+        broad = New<ScriptTranslation>(this, corrector_.get(), poet_.get(), input,
+            segment.start, end_of_input, max_sentences_, sentence_cutoff_threshold_);
+        broad->ShixinTypoCarryBudget(*recovery);
+        const bool has_broad=broad->Evaluate(dict_.get(), enable_user_dict ? user_dict_.get() : nullptr);
+        const bool incomplete=!broad->ShixinTypoBudgetAvailable();
+        broad->ShixinTypoRecordStage(1, has_broad, !incomplete);
+        // The first correction stage completed before this optional second
+        // stage began. Its validated results remain eligible on later expiry.
+        if(!has_broad || incomplete) broad.reset();
+      } else {
+        recovery.reset();
+      }
+      corrector_->ShixinTypoSpecific(false);
+      corrector_->ShixinTypoAbbreviated(false);
+      if (!has_recovery) recovery.reset();
+    }
+    if (!has_ordinary && !recovery && !broad) return nullptr;
+    if (shixin_typo_separate_)
+      return New<ShixinTypoSeparateTranslation>(
+          has_ordinary ? New<DistinctTranslation>(ordinary) : nullptr,
+          New<ShixinTypoRecoveryTranslation>(recovery, broad, input.size(), input.size()==3 ? 2 : 4));
+    int page = 5;
+    engine_->schema()->config()->GetInt("menu/page_size", &page);
+    page = std::max(1, std::min(10, page));
+    return New<ShixinTypoProtectedTranslation>(
+        has_ordinary ? New<DistinctTranslation>(ordinary) : nullptr, recovery, broad, page, input.size(), input.size()==3 ? 2 : 4);
+  }
   // the translator should survive translations it creates
   auto result = New<ScriptTranslation>(
       this, corrector_.get(), poet_.get(), input, segment.start, end_of_input,
@@ -365,6 +606,9 @@ Spans ScriptSyllabifier::Syllabify(const Phrase* phrase) {
 }
 
 size_t ScriptSyllabifier::BuildSyllableGraph(Prism& prism) {
+  syllable_graph_.shixin_typo_probe_cap=translator_->shixin_typo_probe_cap();
+  if (!syllable_graph_.shixin_typo_budget_carried)
+    syllable_graph_.shixin_typo_work_left=translator_->shixin_typo_work_cap();
   return (size_t)syllabifier_.BuildSyllableGraph(input_, prism,
                                                  &syllable_graph_);
 }
@@ -405,6 +649,37 @@ bool ScriptSyllabifier::IsCorrection(const Code& code,
     }
   }
   return false;
+}
+
+int ScriptSyllabifier::ShixinTypoCorrectionCount(const Code& code,
+    size_t code_length, shixin_typo::EditTrace* trace) const {
+  if (trace) *trace = {};
+  if (code.size() > 32) return 99;
+  std::array<const SpellingProperties*, 32> path{};
+  SyllabifyTask task{
+      code, syllable_graph_, code_length,
+      [&](SyllabifyTask* task, size_t depth, size_t current_pos, size_t next_pos) {
+        path[depth] = nullptr;
+        auto begin = syllable_graph_.edges.find(current_pos);
+        if (begin == syllable_graph_.edges.end()) return;
+        auto end = begin->second.find(next_pos);
+        if (end == begin->second.end()) return;
+        auto prop = end->second.find(task->code[depth]);
+        if (prop != end->second.end()) path[depth] = &prop->second;
+      },
+      [&](SyllabifyTask*, size_t depth) { path[depth] = nullptr; }};
+  size_t budget = 1024;
+  if (!syllabify_dfs(&task, 0, 0, &budget)) return 99;
+  int count = 0;
+  for (size_t depth = 0; depth < code.size(); ++depth) {
+    if (!path[depth]) return 99;
+    if (path[depth]->is_correction) {
+      ++count;
+      if (trace) *trace = path[depth]->shixin_typo_trace;
+    }
+  }
+  if (trace && count != 1) *trace = {};
+  return count;
 }
 
 string ScriptSyllabifier::GetPreeditString(const Phrase& cand) const {
@@ -453,12 +728,14 @@ static bool has_exact_match_phrase(Ptr ptr, Iter iter, size_t consumed) {
 bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
   size_t consumed = syllabifier_->BuildSyllableGraph(*dict->prism());
   const auto& syllable_graph = syllabifier_->syllable_graph();
-  bool predict_word = translator_->enable_word_completion() &&
+  if (syllable_graph.shixin_typo_exhausted) return false;
+  bool predict_word = !syllable_graph.shixin_typo_bounded && translator_->enable_word_completion() &&
                       start_ + consumed == end_of_input_;
 
   phrase_ =
       dict->Lookup(syllable_graph, 0, &translator_->blacklist(), predict_word);
-  if (user_dict) {
+  if (user_dict && !syllable_graph.shixin_typo_exhausted && !syllable_graph.shixin_typo_three_initials) {
+    if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::UserLookup;
     const size_t kUnlimitedDepth = 0;
     const size_t kNumSyllablesToPredictWord = 4;
     user_phrase_ =
@@ -472,6 +749,10 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
     phrase_iter_ = phrase_->rbegin();
   if (user_phrase_)
     user_phrase_iter_ = user_phrase_->rbegin();
+
+  // A completed graph can safely support entries materialized before lookup
+  // exhaustion. Do not spend more time constructing sentences or user lookups.
+  if (syllable_graph.shixin_typo_exhausted) return !CheckEmpty();
 
   auto is_correction_match = [&](auto& iter_pair, size_t len) {
     if (iter_pair.first != len || iter_pair.second.exhausted())
@@ -493,8 +774,12 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
              << ", has_reliable_user_phrase: " << has_reliable_user_phrase
              << ", has_at_least_two_syllables: " << has_at_least_two_syllables;
   // make sentences when there is no exact-matching phrase candidate
+  const bool shixin_typo_has_full_phrase = syllable_graph.shixin_typo_bounded &&
+      (has_exact_match_phrase(phrase_, phrase_iter_, consumed) ||
+       has_exact_match_phrase(user_phrase_, user_phrase_iter_, consumed));
   if (has_at_least_two_syllables && !has_reliable_phrase &&
-      !has_reliable_user_phrase) {
+      !has_reliable_user_phrase && !shixin_typo_has_full_phrase) {
+    if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::Sentence;
     if (max_sentences_ > 1)
       sentences_ = MakeSentences(dict, user_dict);
     else if (max_sentences_) {
@@ -506,6 +791,8 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
     }
   }
 
+  if (syllable_graph.shixin_typo_exhausted) return false;
+  if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::Ready;
   return !CheckEmpty();
 }
 
@@ -545,7 +832,7 @@ bool ScriptTranslation::Next() {
         break;
       }
     }
-  } while (enable_correction_ &&
+  } while (enable_correction_ && !translator_->shixin_typo_protect() &&
            syllabifier_->IsCorrection(candidate_->code(),
                                       candidate_->end() - start_) &&
            // limit the number of correction candidates

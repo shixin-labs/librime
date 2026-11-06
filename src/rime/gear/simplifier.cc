@@ -192,6 +192,10 @@ Simplifier::Simplifier(const Ticket& ticket, an<Opencc> opencc)
       }
     }
   }
+  bool separate = false;
+  if (auto config = engine_->schema()->config())
+    if (config->GetBool("translator/shixin_typo_separate", &separate) && separate && opencc_)
+      opencc_->Initialize();
   if (option_name_.empty()) {
     option_name_ = "simplification";  // default switcher option
   }

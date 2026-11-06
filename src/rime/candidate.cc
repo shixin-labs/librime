@@ -8,25 +8,33 @@
 
 namespace rime {
 
-static an<Candidate> UnpackShadowCandidate(const an<Candidate>& cand) {
-  auto shadow = As<ShadowCandidate>(cand);
-  return shadow ? shadow->item() : cand;
-}
-
+// Scratch: conversion may wrap a correction shadow (and uniquification may
+// wrap either). Preserve the native identity through a bounded wrapper chain.
+// Reject malformed/deeper chains rather than recursing without a limit.
 an<Candidate> Candidate::GetGenuineCandidate(const an<Candidate>& cand) {
-  auto uniquified = As<UniquifiedCandidate>(cand);
-  return UnpackShadowCandidate(uniquified ? uniquified->items().front() : cand);
+  auto current = cand;
+  for (size_t depth = 0; current; ++depth) {
+    if (auto shadow = As<ShadowCandidate>(current)) {
+      if (depth == 8) return nullptr;
+      current = shadow->item();
+    } else if (auto unique = As<UniquifiedCandidate>(current)) {
+      if (depth == 8 || unique->items().empty()) return nullptr;
+      current = unique->items().front();
+    } else {
+      return current;
+    }
+  }
+  return nullptr;
 }
 
-vector<of<Candidate>> Candidate::GetGenuineCandidates(
-    const an<Candidate>& cand) {
+vector<of<Candidate>> Candidate::GetGenuineCandidates(const an<Candidate>& cand) {
   vector<of<Candidate>> result;
   if (auto uniquified = As<UniquifiedCandidate>(cand)) {
     for (const auto& item : uniquified->items()) {
-      result.push_back(UnpackShadowCandidate(item));
+      if (auto genuine = GetGenuineCandidate(item)) result.push_back(genuine);
     }
-  } else {
-    result.push_back(UnpackShadowCandidate(cand));
+  } else if (auto genuine = GetGenuineCandidate(cand)) {
+    result.push_back(genuine);
   }
   return result;
 }

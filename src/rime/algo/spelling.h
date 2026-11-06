@@ -10,6 +10,8 @@
 
 #include <rime/common.h>
 
+#include <rime/dict/edit_trace.h>
+
 namespace rime {
 
 enum SpellingType {
@@ -27,6 +29,7 @@ struct SpellingProperties {
   double credibility = 0.0;
   string tips;
   bool is_correction = false;
+  shixin_typo::EditTrace shixin_typo_trace{};
 
   // 疊加運算規則, 將運算規則產生的屬性應用到當前拼寫上
   void Compose(const SpellingProperties& delta);

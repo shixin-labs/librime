@@ -30,6 +30,9 @@ class Filter : public Class<Filter, const Ticket&> {
 
   virtual bool AppliesToSegment(Segment* segment) { return true; }
 
+  // Scratch: only filters audited for an independent candidate history opt in.
+  virtual bool SupportsShixinTypoCorrections() const { return false; }
+
   string name_space() const { return name_space_; }
 
  protected:

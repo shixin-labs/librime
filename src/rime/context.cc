@@ -6,6 +6,10 @@
 //
 #include <algorithm>
 #include <utility>
+#include <atomic>
+#include <limits>
+#include <rime/gear/correction_registry.h>
+#include <rime/gear/correction_filters.h>
 #include <rime/candidate.h>
 #include <rime/context.h>
 #include <rime/menu.h>
@@ -13,12 +17,68 @@
 
 namespace rime {
 
+namespace {
+uint64_t NewShixinTypoIncarnation() {
+  static std::atomic<uint64_t> next{1};
+  auto value = next.load(std::memory_order_relaxed);
+  while (value != std::numeric_limits<uint64_t>::max()) {
+    if (next.compare_exchange_weak(value, value+1, std::memory_order_relaxed)) return value;
+  }
+  return 0;
+}
+}
+Context::Context() : shixin_typo_incarnation_(NewShixinTypoIncarnation()) {}
+Context::~Context() { shixin_typo_registry_.reset(); }
+
+bool Context::ConfigureShixinTypoCorrections(uint64_t generation) {
+  if (!generation || !shixin_typo_incarnation_ || shixin_typo_revision_ == std::numeric_limits<uint64_t>::max()) return false;
+  if (!shixin_typo_registry_) shixin_typo_registry_.reset(new shixin_typo::CorrectionRegistry);
+  if (generation != shixin_typo_generation_) {
+    shixin_typo_generation_ = generation;
+    InvalidateShixinTypoCorrections();
+  }
+  return true;
+}
+void Context::InvalidateShixinTypoCorrections() {
+  if (!shixin_typo_registry_) return;
+  shixin_typo_registry_->Clear();
+  if (shixin_typo_revision_ != std::numeric_limits<uint64_t>::max()) ++shixin_typo_revision_;
+}
+bool Context::PublishShixinTypoCorrections() {
+  if (!shixin_typo_registry_ || !shixin_typo_generation_ || !shixin_typo_revision_ ||
+      shixin_typo_revision_ == std::numeric_limits<uint64_t>::max() || composition_.empty()) return false;
+  auto snapshot = As<ShixinTypoCorrectionFilterTranslation>(composition_.back().shixin_typo_corrections);
+  if (!snapshot) return false;
+  std::array<shixin_typo::CorrectionChoice, 8> choices;
+  const auto count = snapshot->candidate_count();
+  if (count > choices.size()) return false;
+  for (size_t i=0; i<count; ++i)
+    if (!shixin_typo::ChoiceFromNativeTrace(*this, snapshot->candidate_at(i), &choices[i])) {
+      shixin_typo_registry_->Clear(); return false;
+    }
+  if (!shixin_typo_registry_->Publish(*this, {shixin_typo_generation_, shixin_typo_incarnation_, shixin_typo_revision_}, choices.data(), count)) return false;
+  shixin_typo_registry_->Seal();
+  return true;
+}
+size_t Context::ShixinTypoCorrectionSize() const {
+  return shixin_typo_registry_ ? shixin_typo_registry_->size() : 0;
+}
+bool Context::ReadShixinTypoCorrection(size_t index, shixin_typo::CorrectionView* view) const {
+  return shixin_typo_registry_ && shixin_typo_registry_->Read(*this,
+      {shixin_typo_generation_, shixin_typo_incarnation_, shixin_typo_revision_}, index, view);
+}
+bool Context::SelectShixinTypoCorrection(const shixin_typo::CorrectionToken& token) {
+  return shixin_typo_registry_ && shixin_typo_registry_->Select(*this,
+      {shixin_typo_generation_, shixin_typo_incarnation_, shixin_typo_revision_}, token);
+}
+
 const string kSelectedBeforeEditing = "selected_before_editing";
 
 bool Context::Commit() {
   if (!IsComposing())
     return false;
   // notify the engine and interesting components
+  InvalidateShixinTypoCorrections();
   commit_notifier_(this);
   // start over
   Clear();
@@ -70,6 +130,7 @@ bool Context::PushInput(char ch) {
     input_.insert(caret_pos_, 1, ch);
     ++caret_pos_;
   }
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
   return true;
 }
@@ -82,6 +143,7 @@ bool Context::PushInput(const string& str) {
     input_.insert(caret_pos_, str);
     caret_pos_ += str.length();
   }
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
   return true;
 }
@@ -91,6 +153,7 @@ bool Context::PopInput(size_t len) {
     return false;
   caret_pos_ -= len;
   input_.erase(caret_pos_, len);
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
   return true;
 }
@@ -99,6 +162,7 @@ bool Context::DeleteInput(size_t len) {
   if (caret_pos_ + len > input_.length())
     return false;
   input_.erase(caret_pos_, len);
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
   return true;
 }
@@ -107,11 +171,13 @@ void Context::Clear() {
   input_.clear();
   caret_pos_ = 0;
   composition_.clear();
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
 }
 
 void Context::AbortComposition() {
   Clear();
+  InvalidateShixinTypoCorrections();
   abort_notifier_(this);
 }
 
@@ -120,13 +186,28 @@ bool Context::Select(size_t index) {
     return false;
   Segment& seg(composition_.back());
   if (auto cand = seg.GetCandidateAt(index)) {
+    seg.selected_candidate_override.reset();
     seg.selected_index = index;
     seg.status = Segment::kSelected;
     DLOG(INFO) << "Selected: '" << cand->text() << "', index = " << index;
+    InvalidateShixinTypoCorrections();
     select_notifier_(this);
     return true;
   }
   return false;
+}
+
+bool Context::SelectExplicitCandidate(an<Candidate> candidate) {
+  if (!candidate || composition_.empty()) return false;
+  Segment& seg(composition_.back());
+  if (seg.status >= Segment::kSelected || candidate->start() != seg.start ||
+      candidate->end() <= candidate->start() || candidate->end() > seg.end ||
+      seg.end > input_.size()) return false;
+  seg.selected_candidate_override = std::move(candidate);
+  seg.status = Segment::kSelected;
+  InvalidateShixinTypoCorrections();
+  select_notifier_(this);
+  return true;
 }
 
 bool Context::Highlight(size_t index) {
@@ -137,11 +218,13 @@ bool Context::Highlight(size_t index) {
   size_t new_index =
       candidate_count > 0 ? (std::min)(candidate_count - 1, index) : 0;
   size_t previous_index = seg.selected_index;
-  if (previous_index == new_index) {
+  if (previous_index == new_index && !seg.selected_candidate_override) {
     DLOG(INFO) << "selection has not changed, currently at " << new_index;
     return false;
   }
+  seg.selected_candidate_override.reset();
   seg.selected_index = new_index;
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
   DLOG(INFO) << "selection changed from: " << previous_index
              << " to: " << new_index;
@@ -152,8 +235,12 @@ bool Context::DeleteCandidate(size_t index) {
   if (composition_.empty())
     return false;
   Segment& seg(composition_.back());
+  auto candidate = seg.GetCandidateAt(index);
+  if (!candidate) return false;
+  seg.selected_candidate_override.reset();
   seg.selected_index = index;
   DLOG(INFO) << "Deleting candidate: " << seg.GetSelectedCandidate()->text();
+  InvalidateShixinTypoCorrections();
   delete_notifier_(this);
   return true;  // CAVEAT: this doesn't mean anything is deleted for sure
 }
@@ -162,6 +249,11 @@ bool Context::DeleteCurrentSelection() {
   if (composition_.empty())
     return false;
   Segment& seg(composition_.back());
+  if (seg.selected_candidate_override) {
+    InvalidateShixinTypoCorrections();
+    delete_notifier_(this);
+    return true;
+  }
   return DeleteCandidate(seg.selected_index);
 }
 
@@ -180,6 +272,7 @@ bool Context::ConfirmCurrentSelection() {
     }
     // confirm raw input
   }
+  InvalidateShixinTypoCorrections();
   select_notifier_(this);
   return true;
 }
@@ -207,6 +300,7 @@ bool Context::ReopenPreviousSegment() {
         composition_.back().status >= Segment::kSelected) {
       composition_.back().Reopen(caret_pos());
     }
+    InvalidateShixinTypoCorrections();
     update_notifier_(this);
     return true;
   }
@@ -236,6 +330,7 @@ bool Context::ReopenPreviousSelection() {
         composition_.pop_back();
       }
       it->Reopen(caret_pos());
+      InvalidateShixinTypoCorrections();
       update_notifier_(this);
       return true;
     }
@@ -251,6 +346,7 @@ bool Context::ClearNonConfirmedComposition() {
     reverted = true;
   }
   if (reverted) {
+    InvalidateShixinTypoCorrections();
     composition_.Forward();
     DLOG(INFO) << "composition: " << composition_.GetDebugText();
   }
@@ -259,6 +355,7 @@ bool Context::ClearNonConfirmedComposition() {
 
 bool Context::RefreshNonConfirmedComposition() {
   if (ClearNonConfirmedComposition()) {
+    InvalidateShixinTypoCorrections();
     update_notifier_(this);
     return true;
   }
@@ -270,22 +367,26 @@ void Context::set_caret_pos(size_t caret_pos) {
     caret_pos_ = input_.length();
   else
     caret_pos_ = caret_pos;
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
 }
 
 void Context::set_composition(Composition&& comp) {
+  InvalidateShixinTypoCorrections();
   composition_ = std::move(comp);
 }
 
 void Context::set_input(const string& value) {
   input_ = value;
   caret_pos_ = input_.length();
+  InvalidateShixinTypoCorrections();
   update_notifier_(this);
 }
 
 void Context::set_option(const string& name, bool value) {
   options_[name] = value;
   DLOG(INFO) << "Context::set_option " << name << " = " << value;
+  InvalidateShixinTypoCorrections();
   option_update_notifier_(this, name);
 }
 
@@ -299,6 +400,7 @@ bool Context::get_option(const string& name) const {
 
 void Context::set_property(const string& name, const string& value) {
   properties_[name] = value;
+  InvalidateShixinTypoCorrections();
   property_update_notifier_(this, name);
 }
 
@@ -311,6 +413,7 @@ string Context::get_property(const string& name) const {
 }
 
 void Context::ClearTransientOptions() {
+  InvalidateShixinTypoCorrections();
   DLOG(INFO) << "Context::ClearTransientOptions";
   auto opt = options_.lower_bound("_");
   while (opt != options_.end() && !opt->first.empty() && opt->first[0] == '_') {

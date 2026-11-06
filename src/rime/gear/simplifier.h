@@ -24,6 +24,8 @@ class Simplifier : public Filter, TagMatching {
 
   virtual bool AppliesToSegment(Segment* segment) { return TagsMatch(segment); }
 
+  bool SupportsShixinTypoCorrections() const override { return !random_; }
+
   bool Convert(const an<Candidate>& original, CandidateQueue* result);
 
  protected:

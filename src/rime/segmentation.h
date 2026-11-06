@@ -14,6 +14,7 @@ namespace rime {
 
 class Candidate;
 class Menu;
+class Translation;
 
 struct Segment {
   enum Status {
@@ -28,7 +29,9 @@ struct Segment {
   size_t length = 0;
   set<string> tags;
   an<Menu> menu;
+  an<Translation> shixin_typo_corrections;
   size_t selected_index = 0;
+  an<Candidate> selected_candidate_override;
   string prompt;
 
   Segment() = default;
@@ -40,7 +43,9 @@ struct Segment {
     status = kVoid;
     tags.clear();
     menu.reset();
+    shixin_typo_corrections.reset();
     selected_index = 0;
+    selected_candidate_override.reset();
     prompt.clear();
   }
 

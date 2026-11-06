@@ -30,6 +30,8 @@ class Menu {
 
   RIME_DLL void AddTranslation(an<Translation> translation);
   void AddFilter(Filter* filter);
+  // Call after ordinary filters; preserves the complete ordinary first page.
+  RIME_DLL void AddCorrections(an<Translation> corrections, size_t page_size);
 
   RIME_DLL size_t Prepare(size_t candidate_count);
   RIME_DLL Page* CreatePage(size_t page_size, size_t page_no);

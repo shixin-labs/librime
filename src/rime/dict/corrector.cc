@@ -298,6 +298,8 @@ CorrectorComponent::CorrectorComponent()
     : resolver_(Service::instance().CreateDeployedResourceResolver(
           {"corrector", "", ".correction.bin"})) {}
 
+#include "bounded_corrector.inc"
+
 Corrector* CorrectorComponent::Create(const Ticket& ticket) noexcept {
   // Don't use edit distance based correction for now.
 #if 0
@@ -317,5 +319,8 @@ Corrector* CorrectorComponent::Create(const Ticket& ticket) noexcept {
     return new NearSearchCorrector();
   }
 #endif
+  bool spike = false;
+  if (ticket.schema && ticket.schema->config()->GetBool(ticket.name_space + "/shixin_typo_bounded", &spike) && spike)
+    return new ShixinTypoCorrector();
   return new NearSearchCorrector();
 }

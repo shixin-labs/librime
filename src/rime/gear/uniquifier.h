@@ -13,6 +13,8 @@ namespace rime {
 
 class Uniquifier : public Filter {
  public:
+  bool SupportsShixinTypoCorrections() const override { return true; }
+
   explicit Uniquifier(const Ticket& ticket);
 
   virtual an<Translation> Apply(an<Translation> translation,

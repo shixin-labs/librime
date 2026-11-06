@@ -7,6 +7,8 @@
 #ifndef RIME_SCRIPT_TRANSLATOR_H_
 #define RIME_SCRIPT_TRANSLATOR_H_
 
+#include <array>
+#include <rime/dict/hypothesis_policy.h>
 #include <rime/common.h>
 #include <rime/translation.h>
 #include <rime/translator.h>
@@ -46,6 +48,9 @@ class ScriptTranslator : public Translator,
   bool SaveCommitEntry(CommitEntry& commit_entry);
 
   // options
+  bool shixin_typo_protect() const { return shixin_typo_protect_; }
+  size_t shixin_typo_probe_cap() const { return size_t(shixin_typo_probe_cap_); }
+  size_t shixin_typo_work_cap() const { return size_t(shixin_typo_work_cap_); }
   int max_homophones() const { return max_homophones_; }
   int spelling_hints() const { return spelling_hints_; }
   bool always_show_comments() const { return always_show_comments_; }
@@ -60,6 +65,13 @@ class ScriptTranslator : public Translator,
   int core_word_length_ = 0;
   bool always_show_comments_ = false;
   bool enable_correction_ = false;
+  bool shixin_typo_protect_ = false;
+  bool shixin_typo_separate_ = false;
+  std::unique_ptr<shixin_typo::HypothesisPolicy> shixin_typo_hypotheses_;
+  bool shixin_typo_mirror_unavailable_ = false;
+  int shixin_typo_probe_cap_ = 32768;
+  int shixin_typo_work_cap_ = 32768;
+  std::array<string,7> shixin_typo_reserved_codes_{"rq","sj","xq","dt","ts","rqzh","rqen"};
   bool enable_word_completion_ = false;
   the<Corrector> corrector_;
   the<Poet> poet_;

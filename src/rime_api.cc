@@ -75,3 +75,5 @@ void RimeGetSyncDirSecure(char* dir, size_t buffer_size) {
 const char* RimeGetVersion() {
   return RIME_VERSION;
 }
+
+#include "correction_api.inc"

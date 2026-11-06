@@ -15,6 +15,8 @@
 #include <rime/dict/prism.h>
 #include <rime/dict/vocabulary.h>
 
+#include <rime/dict/edit_trace.h>
+
 namespace rime {
 struct Ticket;
 
@@ -35,6 +37,7 @@ struct Correction {
   size_t distance;
   SyllableId syllable;
   size_t length;
+  shixin_typo::EditTrace shixin_typo_trace{};
 };
 class Corrections : public hash_map<SyllableId, Correction> {
  public:
@@ -56,6 +59,16 @@ class Corrections : public hash_map<SyllableId, Correction> {
 class Corrector : public Class<Corrector, const Ticket&> {
  public:
   virtual ~Corrector() = default;
+  virtual const shixin_typo::EditTrace* ShixinTypoTargetTrace() const { return nullptr; }
+  virtual void ShixinTypoTarget(const shixin_typo::EditTrace*) {}
+  virtual bool ShixinTypoExactAllowed(size_t, size_t) const { return true; }
+  virtual void ShixinTypoSpecific(bool) {}
+  virtual bool ShixinTypoSpecificOnly() const { return false; }
+  virtual void ShixinTypoAbbreviated(bool) {}
+  virtual bool ShixinTypoAbbreviatedOnly() const { return false; }
+  virtual bool ShixinTypoBounded() const { return false; }
+  virtual void ShixinTypoAnchor(size_t) {}
+  virtual bool ShixinTypoAllows(size_t) const { return true; }
   RIME_DLL virtual void ToleranceSearch(const Prism& prism,
                                         const string& key,
                                         corrector::Corrections* results,

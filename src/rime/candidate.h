@@ -9,6 +9,8 @@
 
 #include <rime/common.h>
 
+#include <rime/dict/edit_trace.h>
+
 namespace rime {
 
 class Candidate {
@@ -28,6 +30,10 @@ class Candidate {
   size_t start() const { return start_; }
   size_t end() const { return end_; }
   double quality() const { return quality_; }
+
+  virtual const shixin_typo::EditTrace* shixin_typo_edit_trace() const { return nullptr; }
+
+  virtual bool is_shixin_typo_correction() const { return false; }
 
   // candidate text to commit
   virtual const string& text() const = 0;
@@ -100,6 +106,9 @@ class ShadowCandidate : public Candidate {
   }
   string preedit() const { return item_->preedit(); }
 
+  bool is_shixin_typo_correction() const override { return item_->is_shixin_typo_correction(); }
+  const shixin_typo::EditTrace* shixin_typo_edit_trace() const override { return item_->shixin_typo_edit_trace(); }
+
   const an<Candidate>& item() const { return item_; }
 
  protected:
@@ -130,6 +139,14 @@ class UniquifiedCandidate : public Candidate {
   }
   string preedit() const {
     return !items_.empty() ? items_.front()->preedit() : string();
+  }
+
+  bool is_shixin_typo_correction() const override {
+    return !items_.empty() && items_.front()->is_shixin_typo_correction();
+  }
+
+  const shixin_typo::EditTrace* shixin_typo_edit_trace() const override {
+    return items_.empty() ? nullptr : items_.front()->shixin_typo_edit_trace();
   }
 
   void Append(an<Candidate> item) {

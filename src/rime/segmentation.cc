@@ -27,6 +27,7 @@ bool Segment::Reopen(size_t caret_pos) {
   if (status < kSelected) {
     return false;
   }
+  shixin_typo_corrections.reset();  // A reopened selection is a new publication.
   const size_t original_end_pos = start + length;
   if (original_end_pos == caret_pos) {
     // reuse previous candidates and keep selection
@@ -37,6 +38,7 @@ bool Segment::Reopen(size_t caret_pos) {
     }
     status = kGuess;
   } else {
+    selected_candidate_override.reset();
     status = kVoid;
   }
   return true;
@@ -49,7 +51,7 @@ an<Candidate> Segment::GetCandidateAt(size_t index) const {
 }
 
 an<Candidate> Segment::GetSelectedCandidate() const {
-  return GetCandidateAt(selected_index);
+  return selected_candidate_override ? selected_candidate_override : GetCandidateAt(selected_index);
 }
 
 Segmentation::Segmentation() {}

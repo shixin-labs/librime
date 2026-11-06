@@ -235,7 +235,7 @@ bool Selector::Home(Context* ctx) {
   if (ctx->composition().empty())
     return false;
   Segment& seg(ctx->composition().back());
-  if (seg.selected_index > 0) {
+  if (seg.selected_index > 0 || seg.selected_candidate_override) {
     ctx->Highlight(0);
     return true;
   }

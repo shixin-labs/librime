@@ -12,6 +12,7 @@
 #include <rime/dict/corrector.h>
 #include <rime/dict/prism.h>
 #include "syllabifier.h"
+#include "spelling_boundaries.h"
 
 namespace rime {
 using namespace corrector;
@@ -33,11 +34,48 @@ int Syllabifier::BuildSyllableGraph(const string& input,
   if (input.empty())
     return 0;
 
+  graph->shixin_typo_graph_complete = false;
+  graph->shixin_typo_bounded = corrector_ && corrector_->ShixinTypoBounded();
+  graph->shixin_typo_specific_only = graph->shixin_typo_bounded && corrector_->ShixinTypoSpecificOnly();
+  graph->shixin_typo_three_initials = graph->shixin_typo_bounded && corrector_->ShixinTypoAbbreviatedOnly() && input.size()==3;
+  if (graph->shixin_typo_three_initials) std::copy(input.begin(),input.end(),graph->shixin_typo_raw_initials.begin());
+  if (graph->shixin_typo_three_initials && corrector_->ShixinTypoTargetTrace()) {
+    const auto* edit=corrector_->ShixinTypoTargetTrace();
+    if(edit->end<=3 && edit->begin<edit->end) {
+      graph->shixin_typo_initial_exact=true;
+      for(size_t i=edit->begin;i<edit->end;++i) graph->shixin_typo_raw_initials[i]=edit->to[i-edit->begin];
+    }
+  }
+  if (graph->shixin_typo_bounded && !graph->shixin_typo_budget_carried) {
+#ifdef SHIXIN_TYPO_SANITIZER_TEST
+#if !__has_feature(address_sanitizer)
+#error SHIXIN_TYPO_SANITIZER_TEST requires AddressSanitizer
+#endif
+    // Functional sanitizer tests only. Operation caps are unchanged; Release
+    // latency tests must use the real 900-microsecond deadline below.
+    graph->shixin_typo_deadline = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+#else
+    graph->shixin_typo_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(900);
+#endif
+  }
+  shixin_typo::Boundaries shixin_typo_boundaries;
+  if (graph->shixin_typo_bounded) {
+    shixin_typo_boundaries = shixin_typo::ExactBoundaries(input,delimiters_,[&](size_t pos,auto emit) {
+      if (!graph->SpendShixinTypoWork()) return;
+      std::array<Prism::Match,32> matches;
+      size_t count=prism.trie().commonPrefixSearch(input.c_str()+pos,matches.data(),matches.size(),input.size()-pos);
+      for(size_t i=0;i<std::min(count,matches.size());i++) {
+        if (!graph->SpendShixinTypoWork()) return;
+        emit(matches[i].length);
+      }
+    });
+  }
   size_t farthest = 0;
   VertexQueue queue;
   queue.push(Vertex{0, kNormalSpelling});  // start
 
   while (!queue.empty()) {
+    if (!graph->SpendShixinTypoWork()) return 0;
     Vertex vertex(queue.top());
     queue.pop();
     size_t current_pos = vertex.first;
@@ -67,17 +105,21 @@ int Syllabifier::BuildSyllableGraph(const string& input,
     set<SyllableId> exact_match_syllables;
     auto current_input = input.substr(begin_pos);
     prism.CommonPrefixSearch(current_input, &matches);
+    if (corrector_) matches.erase(std::remove_if(matches.begin(), matches.end(),
+        [&](const Prism::Match& m) { return !corrector_->ShixinTypoExactAllowed(begin_pos, m.length); }), matches.end());
+    Corrections corrections;
     if (corrector_) {
       for (auto& m : matches) {
         exact_match_syllables.insert(m.value);
       }
-      Corrections corrections;
-      corrector_->ToleranceSearch(prism, current_input, &corrections, 5);
+      if (!graph->shixin_typo_bounded || (corrector_->ShixinTypoAllows(begin_pos) && begin_pos<=32 && (shixin_typo_boundaries.forward & (uint64_t(1)<<begin_pos))))
+        corrector_->ToleranceSearch(prism, current_input, &corrections, 5);
       for (const auto& m : corrections) {
+        if (graph->shixin_typo_bounded && !shixin_typo_boundaries.Allows(begin_pos,begin_pos+m.second.length)) continue;
         for (auto accessor = prism.QuerySpelling(m.first);
              !accessor.exhausted(); accessor.Next()) {
           auto props = accessor.properties();
-          if (props.type == kNormalSpelling && !props.is_correction) {
+          if (((props.type == kNormalSpelling && !graph->shixin_typo_three_initials) || (graph->shixin_typo_bounded && !graph->shixin_typo_specific_only && props.type == kAbbreviation)) && !props.is_correction) {
             matches.push_back({m.first, m.second.length});
             break;
           }
@@ -105,6 +147,7 @@ int Syllabifier::BuildSyllableGraph(const string& input,
         // otherwise, it resembles exactly the syllable itself.
         SpellingAccessor accessor(prism.QuerySpelling(m.value));
         while (!accessor.exhausted()) {
+          if (!graph->SpendShixinTypoWork()) return 0;
           SyllableId syllable_id = accessor.syllable_id();
           EdgeProperties props(accessor.properties());
           if (strict_spelling_ && matches_input &&
@@ -116,6 +159,22 @@ int Syllabifier::BuildSyllableGraph(const string& input,
             // spelling-to-syllable map
             if (corrector_ && exact_match_syllables.find(m.value) ==
                                   exact_match_syllables.end()) {
+              if ((graph->shixin_typo_specific_only && props.type != kNormalSpelling) ||
+                  (graph->shixin_typo_three_initials && props.type != kAbbreviation)) {
+                accessor.Next();
+                continue;
+              }
+              if (graph->shixin_typo_bounded) {
+                auto trace = corrections.find(m.value);
+                if (trace == corrections.end() || trace->second.length != m.length ||
+                    trace->second.shixin_typo_trace.kind == shixin_typo::EditTrace::Kind::None ||
+                    begin_pos + trace->second.shixin_typo_trace.end > 32) {
+                  accessor.Next(); continue;
+                }
+                props.shixin_typo_trace = trace->second.shixin_typo_trace;
+                props.shixin_typo_trace.begin += begin_pos;
+                props.shixin_typo_trace.end += begin_pos;
+              }
               props.is_correction = true;
               props.credibility = kCorrectionCredibility;
             }
@@ -250,6 +309,7 @@ int Syllabifier::BuildSyllableGraph(const string& input,
   DLOG(INFO) << "syllabified length: " << graph->interpreted_length;
 
   Transpose(graph);
+  graph->shixin_typo_graph_complete = !graph->shixin_typo_exhausted;
 
   return farthest;
 }

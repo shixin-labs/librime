@@ -97,6 +97,7 @@ void Switcher::HighlightNextSchema() {
       option = seg.GetCandidateAt(index);
     }
   } while (!option || option->type() != "schema");
+  seg.selected_candidate_override.reset();
   seg.selected_index = index;
   seg.tags.insert("paging");
   return;

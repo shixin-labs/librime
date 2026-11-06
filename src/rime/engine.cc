@@ -23,6 +23,8 @@
 #include <rime/translation.h>
 #include <rime/translator.h>
 
+#include <rime/gear/correction_filters.h>
+
 namespace rime {
 
 class ConcreteEngine : public Engine {
@@ -53,6 +55,8 @@ class ConcreteEngine : public Engine {
   vector<of<Formatter>> formatters_;
   vector<of<Processor>> post_processors_;
   an<Switcher> switcher_;
+  bool typo_menu_ = false;
+  int typo_page_size_ = 5;
 };
 
 // implementations
@@ -154,6 +158,7 @@ void ConcreteEngine::OnPropertyUpdate(Context* ctx, const string& property) {
 void ConcreteEngine::Compose(Context* ctx) {
   if (!ctx)
     return;
+  ctx->InvalidateShixinTypoCorrections();
   Composition& comp = ctx->composition();
   const string active_input = ctx->input().substr(0, ctx->caret_pos());
   DLOG(INFO) << "active input: " << active_input;
@@ -166,6 +171,7 @@ void ConcreteEngine::Compose(Context* ctx) {
   CalculateSegmentation(&comp);
   TranslateSegments(&comp);
   DLOG(INFO) << "composition: [" << comp.GetDebugText() << "]";
+  ctx->PublishShixinTypoCorrections();
 }
 
 void ConcreteEngine::CalculateSegmentation(Segmentation* segments) {
@@ -211,10 +217,16 @@ void ConcreteEngine::TranslateSegments(Segmentation* segments) {
     string input = segments->input().substr(segment.start, len);
     DLOG(INFO) << "translating segment: [" << input << "]";
     auto menu = New<Menu>();
+    segment.shixin_typo_corrections.reset();
     for (auto& translator : translators_) {
       auto translation = translator->Query(input, segment);
       if (!translation)
         continue;
+      auto corrections = translation->TakeShixinTypoCorrections();
+      // Current schemas have one script translator. Do not merge an unbounded
+      // number of auxiliary streams if a scratch schema violates that premise.
+      if (corrections && !segment.shixin_typo_corrections)
+        segment.shixin_typo_corrections = std::move(corrections);
       if (translation->exhausted()) {
         DLOG(INFO) << translator->name_space() << " made a futile translation.";
         continue;
@@ -226,9 +238,20 @@ void ConcreteEngine::TranslateSegments(Segmentation* segments) {
         menu->AddFilter(filter.get());
       }
     }
+    if (segment.shixin_typo_corrections) {
+      auto corrections = New<ShixinTypoCorrectionFilterTranslation>(segment.shixin_typo_corrections);
+      for (auto& filter : filters_)
+        if (filter->SupportsShixinTypoCorrections() && filter->AppliesToSegment(&segment))
+          corrections->AddFilter(filter.get());
+      corrections->Finish();
+      segment.shixin_typo_corrections = corrections;
+      if (typo_menu_)
+        menu->AddCorrections(corrections, typo_page_size_);
+    }
     segment.status = Segment::kGuess;
     segment.menu = menu;
     segment.selected_index = 0;
+    segment.selected_candidate_override.reset();
   }
 }
 
@@ -377,6 +400,10 @@ void ConcreteEngine::InitializeOptions() {
   LOG(INFO) << "ConcreteEngine::InitializeOptions";
   // reset custom switches
   Config* config = schema_->config();
+  typo_menu_ = false;
+  typo_page_size_ = 5;
+  config->GetBool("shixin_typo/menu", &typo_menu_);
+  config->GetInt("menu/page_size", &typo_page_size_);
   Switches switches(config);
   switches.FindOption([this](Switches::SwitchOption option) {
     LOG(INFO) << "found switch option: " << option.option_name

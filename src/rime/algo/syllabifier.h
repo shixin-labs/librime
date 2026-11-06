@@ -9,6 +9,7 @@
 #define RIME_SYLLABIFIER_H_
 
 #include <stdint.h>
+#include <chrono>
 #include <rime_api.h>
 #include <rime/common.h>
 #include "spelling.h"
@@ -36,7 +37,65 @@ using SpellingPropertiesList = vector<const EdgeProperties*>;
 using SpellingIndex = map<SyllableId, SpellingPropertiesList>;
 using SpellingIndices = map<size_t, SpellingIndex>;
 
+enum class ShixinTypoSearchPhase : uint8_t { Graph, Lookup, Sort, UserLookup, Sentence, Ready, BeforeSort };
+
+enum class ShixinTypoStopReason : uint8_t { None, Deadline, Work, Nodes, Chunks, Other };
+
 struct SyllableGraph {
+  bool shixin_typo_bounded = false;
+  bool shixin_typo_budget_carried = false;
+  bool shixin_typo_specific_only = false;
+  bool shixin_typo_three_initials = false;
+  bool shixin_typo_initial_exact = false;
+  size_t shixin_typo_probe_cap = 32768;
+  std::array<char,3> shixin_typo_raw_initials{};
+  bool shixin_typo_graph_complete = false;
+  mutable size_t shixin_typo_work_left = 32768;
+  mutable size_t shixin_typo_nodes_left = 2048, shixin_typo_chunks_left = 2048;
+  std::chrono::steady_clock::time_point shixin_typo_deadline;
+  mutable bool shixin_typo_exhausted = false;
+  mutable ShixinTypoStopReason shixin_typo_stop_reason = ShixinTypoStopReason::None;
+  mutable ShixinTypoSearchPhase shixin_typo_phase = ShixinTypoSearchPhase::Graph;
+  bool FailShixinTypo(ShixinTypoStopReason reason) const {
+    if (!shixin_typo_exhausted) shixin_typo_stop_reason = reason;
+    shixin_typo_exhausted = true;
+    return false;
+  }
+  void CarryShixinTypoBudgetFrom(const SyllableGraph& source) {
+    shixin_typo_budget_carried = true;
+    shixin_typo_work_left = source.shixin_typo_work_left;
+    shixin_typo_nodes_left = source.shixin_typo_nodes_left;
+    shixin_typo_chunks_left = source.shixin_typo_chunks_left;
+    shixin_typo_deadline = source.shixin_typo_deadline;
+    shixin_typo_exhausted = source.shixin_typo_exhausted;
+    shixin_typo_stop_reason = source.shixin_typo_stop_reason;
+  }
+  bool CheckShixinTypoDeadline() const {
+    if (!shixin_typo_bounded) return true;
+    if (shixin_typo_exhausted) return false;
+    if (std::chrono::steady_clock::now() >= shixin_typo_deadline)
+      return FailShixinTypo(ShixinTypoStopReason::Deadline);
+    return true;
+  }
+  bool SpendShixinTypoWork() const {
+    if (!shixin_typo_bounded) return true;
+    if (shixin_typo_exhausted) return false;
+    if (!shixin_typo_work_left) return FailShixinTypo(ShixinTypoStopReason::Work);
+    if ((shixin_typo_work_left & 63) == 0 && std::chrono::steady_clock::now() >= shixin_typo_deadline)
+      return FailShixinTypo(ShixinTypoStopReason::Deadline);
+    --shixin_typo_work_left;
+    return true;
+  }
+  bool SpendShixinTypoNode() const {
+    if (!shixin_typo_bounded) return true;
+    if (!shixin_typo_nodes_left) return FailShixinTypo(ShixinTypoStopReason::Nodes);
+    --shixin_typo_nodes_left; return SpendShixinTypoWork();
+  }
+  bool SpendShixinTypoChunk() const {
+    if (!shixin_typo_bounded) return true;
+    if (!shixin_typo_chunks_left) return FailShixinTypo(ShixinTypoStopReason::Chunks);
+    --shixin_typo_chunks_left; return SpendShixinTypoWork();
+  }
   size_t input_length = 0;
   size_t interpreted_length = 0;
   VertexMap vertices;

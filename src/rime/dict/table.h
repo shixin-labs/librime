@@ -8,6 +8,7 @@
 #ifndef RIME_TABLE_H_
 #define RIME_TABLE_H_
 
+#include <array>
 #include <cstring>
 #include <rime/common.h>
 #include <rime/dict/mapped_file.h>
@@ -122,6 +123,9 @@ class TableAccessor {
   RIME_DLL bool exhausted() const;
   RIME_DLL size_t remaining() const;
   RIME_DLL const table::Entry* entry() const;
+  TableAccessor(const Code& code, const table::Entry* entry, double credibility, double quality_len, std::string_view cached_text = {})
+      : index_code_(code), entries_(entry), size_(1), credibility_(credibility), quality_len_(quality_len), cached_text_(cached_text) {}
+  std::string_view cached_text() const { return cached_text_; }
   RIME_DLL const table::Code* extra_code() const;
   const Code& index_code() const { return index_code_; }
   Code code() const;
@@ -136,6 +140,7 @@ class TableAccessor {
   size_t cursor_ = 0;
   double credibility_ = 0.0;
   double quality_len_ = 0.0;
+  std::string_view cached_text_;
 };
 
 using TableQueryResult = map<int, vector<TableAccessor>>;
@@ -163,21 +168,24 @@ class TableQuery {
   void Reset();
 
   size_t level() const { return level_; }
+  const table::TrunkIndex* ShixinTypoChildren() const {
+    return level_ == 1 ? lv2_index_ : level_ == 2 ? lv3_index_ : nullptr;
+  }
 
   double credibility_sum() const {
-    return credibility_.empty() ? 0 : credibility_.back();
+    return level_ ? credibility_[level_ - 1] : 0;
   }
   double quality_len_sum() const {
-    return quality_len_.empty() ? 0 : quality_len_.back();
+    return level_ ? quality_len_[level_ - 1] : 0;
   }
-  size_t last_pos() const { return last_pos_.empty() ? 0 : last_pos_.back(); }
+  size_t last_pos() const { return level_ ? last_pos_[level_ - 1] : 0; }
 
  protected:
   size_t level_ = 0;
   Code index_code_;
-  vector<double> credibility_;
-  vector<double> quality_len_;
-  vector<size_t> last_pos_;
+  std::array<double, Code::kIndexCodeMaxLength> credibility_{};
+  std::array<double, Code::kIndexCodeMaxLength> quality_len_{};
+  std::array<size_t, Code::kIndexCodeMaxLength> last_pos_{};
 
  private:
   bool Walk(SyllableId syllable_id);
@@ -188,12 +196,21 @@ class TableQuery {
   table::TailIndex* lv4_index_ = nullptr;
 };
 
+struct ShixinTypoInitialCache;
+
 class Table : public MappedFile {
  public:
   RIME_DLL Table(const path& file_path);
   virtual ~Table();
 
   RIME_DLL bool Load();
+  RIME_DLL bool PrepareShixinTypoInitialCache(const string& sidecar_path = {});
+  RIME_DLL bool PrepareShixinTypoMirrorCache(const string& mirror_path);
+  RIME_DLL bool PrepareShixinTypoCanonicalTable(const string& path);
+  RIME_DLL bool WarmShixinTypoPages();
+  RIME_DLL bool WarmShixinTypoStrings();
+  RIME_DLL bool WarmShixinTypoIndexes(bool include_short_entries = false);
+  Table* ShixinTypoCanonicalTable() const { return shixin_typo_canonical_table_.get(); }
   RIME_DLL bool Save();
   RIME_DLL bool Build(const Syllabary& syllabary,
                       const Vocabulary& vocabulary,
@@ -206,7 +223,9 @@ class Table : public MappedFile {
   RIME_DLL TableAccessor QueryPhrases(const Code& code);
   RIME_DLL bool Query(const SyllableGraph& syll_graph,
                       size_t start_pos,
-                      TableQueryResult* result);
+                      TableQueryResult* result,
+                      bool (*visitor)(void*, size_t, TableAccessor&) = nullptr,
+                      void* visitor_context = nullptr);
   RIME_DLL string GetEntryText(const table::Entry& entry);
 
   uint32_t dict_file_checksum() const;
@@ -238,6 +257,10 @@ class Table : public MappedFile {
   table::Syllabary* syllabary_ = nullptr;
   table::Index* index_ = nullptr;
 
+  the<Table> shixin_typo_canonical_table_;
+  string shixin_typo_canonical_path_;
+  bool shixin_typo_canonical_initialized_ = false;
+  the<ShixinTypoInitialCache> shixin_typo_initial_cache_;
   the<StringTable> string_table_;
   the<StringTableBuilder> string_table_builder_;
 };
