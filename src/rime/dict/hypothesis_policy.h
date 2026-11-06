@@ -8,6 +8,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <rime/common.h>
 #include "prefix_edits.h"
 
 namespace shixin_typo {
@@ -51,7 +52,7 @@ class HypothesisPolicy {
   // Bounded byte reader rejects oversized/truncated/trailing or unsorted records.
   bool Load(const std::string& path) {
     count_ = 0;
-    std::ifstream file(path);
+    std::ifstream file(static_cast<const std::filesystem::path&>(rime::path(path)));
     if (!file) return false;
     char line[96];
     while (file.getline(line, sizeof(line))) {

@@ -127,3 +127,12 @@ TEST(RimeMenuTest, CorrectionsAfterExactlyFullOrdinaryPage) {
   EXPECT_EQ("Alpha", second->candidates[0]->text());
   EXPECT_TRUE(second->is_last_page);
 }
+
+TEST(RimeMenuTest, CorrectionsDeduplicatePrefetchedOrdinaryTail) {
+  Menu menu;
+  menu.AddTranslation(New<TranslationBeta>());
+  auto correction = New<SimpleCandidate>("phrase", 0, 4, "Beta-3", "纠错 →");
+  menu.AddCorrections(New<UniqueTranslation>(correction), 2);
+  EXPECT_EQ(3, menu.Prepare(20));
+  EXPECT_EQ(correction, menu.GetCandidateAt(2));
+}

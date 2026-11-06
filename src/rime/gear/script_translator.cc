@@ -734,7 +734,9 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
 
   phrase_ =
       dict->Lookup(syllable_graph, 0, &translator_->blacklist(), predict_word);
-  if (user_dict && !syllable_graph.shixin_typo_exhausted && !syllable_graph.shixin_typo_three_initials) {
+  // User-dictionary traversal is unbounded; corrections use only the system
+  // dictionary. Ordinary lookup and explicit-selection learning are unchanged.
+  if (user_dict && !syllable_graph.shixin_typo_bounded && !syllable_graph.shixin_typo_exhausted && !syllable_graph.shixin_typo_three_initials) {
     if (syllable_graph.shixin_typo_bounded) syllable_graph.shixin_typo_phase = ShixinTypoSearchPhase::UserLookup;
     const size_t kUnlimitedDepth = 0;
     const size_t kNumSyllablesToPredictWord = 4;

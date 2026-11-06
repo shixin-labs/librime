@@ -64,6 +64,23 @@ class CorrectionsAfterPage : public Translation {
       corrections_->Next();
       ++correction_count_;
     }
+    if (corrections_) {
+      // The ordinary filter has already cached the first tail candidate before
+      // corrections entered its history. Recheck it once when resuming.
+      while (!ordinary_->exhausted()) {
+        auto candidate = ordinary_->Peek();
+        bool duplicate = false;
+        for (const auto& previous : *history_) {
+          if (candidate && previous->text() == candidate->text() &&
+              previous->start() == candidate->start() && previous->end() == candidate->end()) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) break;
+        ordinary_->Next();
+      }
+    }
     corrections_.reset();
     set_exhausted(ordinary_->exhausted());
   }
