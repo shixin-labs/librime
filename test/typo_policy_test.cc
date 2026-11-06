@@ -25,6 +25,8 @@ TEST(HypothesisPolicy, ModelValidation) {
   }
   { std::ofstream out(path); out<<"hao\t-1\t0\nni\t-1\t0\n"; }
   ASSERT_TRUE(policy.Load(path));
+  { std::ofstream out(path, std::ios::binary); out<<"hao\t-1\t0\r\nni\t-1\t0\r\n"; }
+  ASSERT_TRUE(policy.Load(path));
   for(auto raw:{"nihoa","nihso"}) {
     auto budget=Budget(); auto plan=policy.Plan(raw,budget);
     ASSERT_TRUE(plan.complete); ASSERT_EQ(plan.count,1u);

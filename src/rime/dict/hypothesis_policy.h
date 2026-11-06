@@ -57,6 +57,7 @@ class HypothesisPolicy {
     char line[96];
     while (file.getline(line, sizeof(line))) {
       std::string row(line, size_t(file.gcount()) - (file.eof() ? 0 : 1));
+      if (!row.empty() && row.back() == '\r') row.pop_back();
       if (row.find('\0') != row.npos) { count_=0; return false; }
       auto a = row.find('\t'), b = row.find('\t', a == row.npos ? 0 : a+1);
       if (a == row.npos || b == row.npos || a == 0 || a > 6 || count_ == forms_.size()) { count_=0; return false; }
