@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <rime_api.h>
 // Scratch C ABI v1. All multibyte buffer fields are little endian. Call only
 // from the engine's locked thread. Generation must identify a worker lifetime.
 #define SHIXIN_TYPO_CORRECTION_VERSION 1u
@@ -10,14 +11,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-uint32_t shixin_typo_corrections_version(void);
-int32_t shixin_typo_corrections_v1_configure(uintptr_t session,
+RIME_DLL uint32_t shixin_typo_corrections_version(void);
+RIME_DLL int32_t shixin_typo_corrections_v1_configure(uintptr_t session,
                                               uint64_t generation);
-int32_t shixin_typo_corrections_v1_read(uintptr_t session, uint8_t *output,
+RIME_DLL int32_t shixin_typo_corrections_v1_read(uintptr_t session, uint8_t *output,
                                          uint32_t capacity);
-int32_t shixin_typo_corrections_v1_select(uintptr_t session,
+RIME_DLL int32_t shixin_typo_corrections_v1_select(uintptr_t session,
                                            const uint8_t *token, uint32_t size);
-int32_t shixin_typo_corrections_v1_invalidate(uintptr_t session);
+RIME_DLL int32_t shixin_typo_corrections_v1_invalidate(uintptr_t session);
 #ifdef __cplusplus
 }
 #endif
