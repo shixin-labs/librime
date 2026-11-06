@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <chrono>
+#include <array>
 #include <rime_api.h>
 #include <rime/common.h>
 #include "spelling.h"
