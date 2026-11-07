@@ -905,6 +905,11 @@ iter_incremented:
           [this, full_code_length, phrase_code_length]() {
             UserDictEntryIterator& uter = user_phrase_iter_->second;
             DictEntryIterator& iter = phrase_iter_->second;
+            // Imported vocabulary with zero commits is not personal history.
+            // Do not let it exhaust the menu before ordinary system phrases.
+            if (uter.Peek()->commit_count == 0) {
+              return uter.Peek()->weight > iter.Peek()->weight;
+            }
             // 但若用戶詞爲糾錯結果, 則免去優先權, 回歸權重比較
             bool user_is_correction = syllabifier_->IsCorrection(
                 uter.Peek()->code, phrase_code_length);
@@ -930,7 +935,8 @@ iter_incremented:
     candidate_source_ = kUserPhrase;
     candidate_ =
         New<Phrase>(translator_->language(),
-                    entry->IsPredictiveMatch() ? "completion" : "user_phrase",
+                    entry->IsPredictiveMatch() ? "completion" :
+                    entry->commit_count > 0 ? "user_phrase" : "phrase",
                     start_, start_ + user_phrase_code_length, entry);
     candidate_->set_quality(std::exp(entry->weight) +
                             translator_->initial_quality() +
